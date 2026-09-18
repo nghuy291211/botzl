@@ -1,4 +1,0 @@
-{
-    "imei": os.getenv("EMEI"),
-    "cookies": os.getenv("COKIE")
-}
