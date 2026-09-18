@@ -1,6 +1,23 @@
 # -*- coding: utf-8 -*-
-import json, os, re, sys, time, platform, random, threading, inspect, tempfile, shutil, subprocess
+import json, re, sys, time, platform, random, threading, inspect, tempfile, shutil, subprocess
 from datetime import datetime
+import os
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Chạy web server ở luồng riêng
+Thread(target=run).start()
+
 
 try:
     from zlapi import ZaloAPI
