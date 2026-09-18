@@ -72,7 +72,7 @@ def _enqueue_fast(job):
             return False
 # ===========================================================
 
-CONFIG_FILE = "config.py"
+CONFIG_FILE = "config.json"
 if not os.path.exists(CONFIG_FILE):
     print(f"❌ Không tìm thấy {CONFIG_FILE}!"); sys.exit(1)
 try:
