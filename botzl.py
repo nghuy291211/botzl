@@ -1,0 +1,1930 @@
+# -*- coding: utf-8 -*-
+import json, os, re, sys, time, platform, random, threading, inspect, tempfile, shutil
+from datetime import datetime
+
+try:
+    from zlapi import ZaloAPI
+except Exception as e:
+    print(f"[!] Không import được zlapi: {e}"); sys.exit(1)
+try:
+    from zlapi.models import Message
+except Exception: Message = None
+try:
+    from zlapi.models import Mention
+except Exception: Mention = None
+try:
+    from zlapi.models import ThreadType
+except Exception:
+    class ThreadType:
+        GROUP = "Group"; USER = "User"
+try:
+    from zlapi.models import Sticker
+except Exception: Sticker = None
+
+CONFIG_FILE = "config.json"
+if not os.path.exists(CONFIG_FILE):
+    print(f"❌ Không tìm thấy {CONFIG_FILE}!"); sys.exit(1)
+try:
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        _cfg = json.load(f)
+except Exception as e:
+    print(f"❌ Lỗi đọc {CONFIG_FILE}: {e}"); sys.exit(1)
+
+IMEI = str(_cfg.get("imei", "")).strip()
+COOKIES = _cfg.get("cookies", {})
+if not IMEI or IMEI.startswith("DÁN_"): print("❌ Chưa điền IMEI!"); sys.exit(1)
+if not COOKIES or not isinstance(COOKIES, dict): print("❌ Chưa điền COOKIES!"); sys.exit(1)
+print(f"✅ Load config OK | IMEI: {len(IMEI)} | {len(COOKIES)} cookies")
+
+PREFIX = "."
+PERM_FILE   = "zalo_perms.json"
+MUTE_FILE   = "mute_list.json"
+COPY_FILE   = "copy_list.json"
+GROUP_FILE  = "group_config.json"
+STICKER_FILE= "custom_stickers.json"
+WAR_FILE    = "war.txt"
+CHUI_FILE   = "chui.txt"
+SEND_DELAY  = 1.5
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+VOICE_EXTS = (".aac", ".mp3", ".m4a", ".wav", ".ogg", ".opus", ".amr")
+
+START_TIME = time.time()
+BOT_OWNER_ID = None
+BOT_NAME = "Bot Zalo"
+BOT_SLEEPING = False
+MUTED_USERS = {}
+COPY_TARGETS = {}
+WAR_RUNNING = {}
+CHUI_RUNNING = {}
+SPAM_RUNNING = {}
+GROUP_SETTINGS = {}
+GAME_STATE = {}
+CUSTOM_STICKERS = {}
+
+WAR_DELAY_DEFAULT = 2.5
+WAR_DELAY_MIN = 0.25
+WAR_DELAY_MAX = 60.0
+WAR_CONFIRM_TIMEOUT = 60
+CHUI_DELAY_DEFAULT = 1.0
+CHUI_DELAY_MIN = 0.25
+CHUI_DELAY_MAX = 60.0
+SPAM_DELAY_DEFAULT = 0.5
+SPAM_DELAY_MIN = 0.2
+SPAM_DELAY_MAX = 60.0
+
+WAR_CONFIRM_WORDS = {"yes","y","ok","oke","okay","có","co","ừ","u","đồng ý","dong y","xác nhận","xac nhan"}
+WAR_CANCEL_WORDS  = {"no","n","không","khong","hủy","huy","cancel"}
+WAR_PENDING = {}
+CHUI_PENDING = {}
+SPAM_PENDING = {}
+
+def _call(x):
+    if callable(x):
+        try: return x()
+        except Exception: return x
+    return x
+
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception: return default
+    return default
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+ALLOWED_USERS   = load_json(PERM_FILE, {})
+MUTED_USERS     = load_json(MUTE_FILE, {})
+COPY_TARGETS    = load_json(COPY_FILE, {})
+GROUP_SETTINGS  = load_json(GROUP_FILE, {})
+CUSTOM_STICKERS = load_json(STICKER_FILE, {})
+
+def is_user_allowed(uid):
+    if str(uid) == str(BOT_OWNER_ID): return True
+    return str(uid) in ALLOWED_USERS
+
+def is_owner(uid):
+    return str(uid) == str(BOT_OWNER_ID)
+
+def get_group_settings(gid):
+    gid = str(gid)
+    if gid not in GROUP_SETTINGS:
+        GROUP_SETTINGS[gid] = {"antilink": False, "antiimage": False, "antivideo": False, "antifile": False, "lock": False}
+        save_json(GROUP_FILE, GROUP_SETTINGS)
+    return GROUP_SETTINGS[gid]
+
+def save_group_settings():
+    save_json(GROUP_FILE, GROUP_SETTINGS)
+
+def bot_send(bot, tid, ttype, text, skip_delay=False):
+    text = str(text)[:1900]
+    if Message is None: return None
+    msg_obj = None
+    for kwargs in ({"text": text}, {"description": text}, {"title": text}):
+        try: msg_obj = Message(**kwargs); break
+        except Exception: pass
+    if msg_obj is None: return None
+    delay = 0 if skip_delay else SEND_DELAY
+    for mname in ("send", "sendMessage"):
+        if not hasattr(bot, mname): continue
+        try:
+            r = getattr(bot, mname)(msg_obj, tid, ttype)
+            if delay: time.sleep(delay)
+            return r
+        except Exception: pass
+    try:
+        r = bot.send(message=msg_obj, thread_id=tid, thread_type=ttype)
+        if delay: time.sleep(delay)
+        return r
+    except Exception: pass
+    return None
+
+def bot_send_mention(bot, tid, ttype, content, target_uid):
+    content = str(content)[:1900]
+    tag_text = f"@{target_uid}"
+    full_text = f"{tag_text} {content}"
+    if Message is None:
+        return bot_send(bot, tid, ttype, full_text, skip_delay=True)
+    if Mention is not None:
+        try:
+            mention = Mention(target_uid, length=len(tag_text), offset=0)
+            msg = Message(text=full_text, mention=mention)
+            if hasattr(bot, "sendMentionMessage"):
+                try:
+                    r = bot.sendMentionMessage(msg, tid, ttype)
+                    if r: return r
+                except Exception: pass
+        except Exception: pass
+    if Mention is not None:
+        try:
+            mention = Mention(target_uid, length=len(tag_text), offset=0)
+            msg = Message(text=full_text, mention=mention)
+            for mname in ("send", "sendMessage"):
+                if hasattr(bot, mname):
+                    try:
+                        r = getattr(bot, mname)(msg, tid, ttype)
+                        if r: return r
+                    except Exception: pass
+        except Exception: pass
+    try:
+        msg = Message(text=full_text)
+        for mname in ("sendMentionMessage", "send", "sendMessage"):
+            if hasattr(bot, mname):
+                try:
+                    r = getattr(bot, mname)(msg, tid, ttype)
+                    if r: return r
+                except Exception: pass
+    except Exception: pass
+    return bot_send(bot, tid, ttype, full_text, skip_delay=True)
+
+def bot_send_image(bot, tid, ttype, image_path, caption=""):
+    if not os.path.exists(image_path): return False
+    if hasattr(bot, "sendLocalImage"):
+        try:
+            r = bot.sendLocalImage(imagePath=image_path, thread_id=tid, thread_type=ttype, message=caption); return True
+        except Exception: pass
+        if caption:
+            try:
+                r = bot.sendLocalImage(imagePath=image_path, thread_id=tid, thread_type=ttype, caption=caption); return True
+            except Exception: pass
+        try:
+            r = bot.sendLocalImage(image_path, tid, ttype, caption); return True
+        except Exception: pass
+        try:
+            r = bot.sendLocalImage(image_path, tid, ttype)
+            if caption:
+                time.sleep(0.5); bot_send(bot, tid, ttype, caption, skip_delay=True)
+            return True
+        except Exception: pass
+    if hasattr(bot, "sendImage"):
+        try:
+            r = bot.sendImage(image_path, tid, ttype, caption); return True
+        except Exception: pass
+    return False
+
+def upload_to_catbox(filepath):
+    try:
+        if not os.path.exists(filepath): return None
+        if os.path.getsize(filepath) / (1024 * 1024) > 200: return None
+        import requests as req
+        with open(filepath, "rb") as f:
+            files = {"fileToUpload": (os.path.basename(filepath), f)}
+            r = req.post("https://catbox.moe/user/api.php",
+                         data={"reqtype": "fileupload", "userhash": ""},
+                         files=files, timeout=120)
+        if r.status_code == 200 and r.text.strip().startswith("http"):
+            return r.text.strip()
+    except Exception as e:
+        print(f"[UPLOAD-CATBOX] Lỗi: {e}")
+    return None
+
+def upload_to_uguu(filepath):
+    try:
+        if not os.path.exists(filepath): return None
+        import requests
+        with open(filepath, "rb") as f:
+            r = requests.post("https://uguu.se/upload.php",
+                              files={"files[]": (os.path.basename(filepath), f)},
+                              timeout=60)
+        print(f"[UPLOAD-UGUU] HTTP {r.status_code} | {r.text[:200]}")
+        if r.status_code == 200:
+            try:
+                d = r.json()
+                if d.get("success") and d.get("files"):
+                    return d["files"][0].get("url")
+            except Exception:
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line.startswith("http"):
+                        return line
+    except Exception as e:
+        print(f"[UPLOAD-UGUU] Lỗi: {e}")
+    return None
+
+def upload_to_tmpfiles(filepath):
+    try:
+        if not os.path.exists(filepath): return None
+        import requests
+        with open(filepath, "rb") as f:
+            r = requests.post("https://tmpfiles.org/api/v1/upload",
+                              files={"file": (os.path.basename(filepath), f)},
+                              timeout=60)
+        if r.status_code == 200:
+            d = r.json()
+            url = d.get("data", {}).get("url")
+            if url:
+                return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    except Exception as e:
+        print(f"[UPLOAD-TMPFILES] Lỗi: {e}")
+    return None
+
+def upload_voice_smart(filepath):
+    ext = os.path.splitext(filepath)[1].lower()
+    tmp_path = filepath
+    renamed = False
+    if ext == ".aac":
+        tmp_path = filepath.rsplit(".", 1)[0] + ".m4a"
+        try:
+            shutil.copy(filepath, tmp_path)
+            renamed = True
+            print(f"[UPLOAD] Đã đổi .aac → .m4a để Zalo chấp nhận")
+        except Exception: tmp_path = filepath
+
+    hosts = [
+        ("uguu",     upload_to_uguu),
+        ("catbox",   upload_to_catbox),
+        ("tmpfiles", upload_to_tmpfiles),
+    ]
+    for name, fn in hosts:
+        print(f"[UPLOAD] Thử host: {name}")
+        url = fn(tmp_path)
+        if url:
+            print(f"[UPLOAD] ✅ {name} → {url}")
+            if renamed:
+                try: os.remove(tmp_path)
+                except Exception: pass
+            return url
+    if renamed:
+        try: os.remove(tmp_path)
+        except Exception: pass
+    return None
+
+def bot_send_voice(bot, tid, ttype, voice_url):
+    if not voice_url:
+        print("[VOICE] URL rỗng"); return None
+    print(f"[VOICE] Đang thử gửi: {voice_url[:100]}")
+
+    candidates = [
+        ("sendVoice",         lambda m: m(voice_url, tid, ttype)),
+        ("sendVoiceMessage",  lambda m: m(voice_url, tid, ttype)),
+        ("sendRemoteVoice",   lambda m: m(voice_url, tid, ttype)),
+        ("sendVoice",         lambda m: m(voiceUrl=voice_url, thread_id=tid, thread_type=ttype)),
+        ("sendVoiceMessage",  lambda m: m(voiceUrl=voice_url, thread_id=tid, thread_type=ttype)),
+        ("sendRemoteVoice",   lambda m: m(voiceUrl=voice_url, thread_id=tid, thread_type=ttype)),
+        ("sendVoice",         lambda m: m(url=voice_url, thread_id=tid, thread_type=ttype)),
+        ("sendVoiceMessage",  lambda m: m(url=voice_url, thread_id=tid, thread_type=ttype)),
+        ("sendRemoteVoice",   lambda m: m(url=voice_url, thread_id=tid, thread_type=ttype)),
+    ]
+    for mname, caller in candidates:
+        if not hasattr(bot, mname): continue
+        try:
+            r = caller(getattr(bot, mname))
+            print(f"[VOICE] ✅ {mname} OK")
+            return r
+        except Exception as e:
+            print(f"[VOICE] ❌ {mname}: {e}")
+            continue
+
+    if Message is not None:
+        for kw in ({"voiceUrl": voice_url}, {"voice_url": voice_url}, {"voice": voice_url}):
+            try:
+                msg = Message(**kw)
+                for mname in ("send", "sendMessage"):
+                    if hasattr(bot, mname):
+                        try:
+                            r = getattr(bot, mname)(msg, tid, ttype)
+                            print(f"[VOICE] ✅ Message.{mname} OK")
+                            return r
+                        except Exception as e:
+                            print(f"[VOICE] ❌ Message.{mname}: {e}")
+            except Exception: pass
+
+    print("[VOICE] ❌ Tất cả cách đều thất bại")
+    return None
+
+def send_reply(bot, tid, ttype, text, mention_id=None):
+    bot_send(bot, tid, ttype, text)
+
+def format_uptime(s):
+    d, h = divmod(int(s), 86400); h, m = divmod(h, 3600); m, s = divmod(m, 60)
+    p = []
+    if d: p.append(f"{d} ngày")
+    if h: p.append(f"{h} giờ")
+    if m: p.append(f"{m} phút")
+    p.append(f"{s} giây")
+    return " ".join(p)
+
+def parse_message_text(message):
+    if message is None: return ""
+    if isinstance(message, str): return message.strip()
+    if isinstance(message, dict):
+        if "href" in message or "thumb" in message: return ""
+        for k in ("text", "content", "body", "message"):
+            v = message.get(k)
+            if isinstance(v, str) and v: return v.strip()
+        return ""
+    if hasattr(message, "href") or hasattr(message, "thumb"):
+        for k in ("text", "content", "body"):
+            v = getattr(message, k, None)
+            if isinstance(v, str) and v.strip(): return v.strip()
+        return ""
+    for k in ("text", "content", "body", "message"):
+        v = getattr(message, k, None)
+        if isinstance(v, str) and v: return v.strip()
+    return ""
+
+def detect_media_type(message):
+    if message is None or isinstance(message, str): return None
+    def _get(n): return message.get(n) if isinstance(message, dict) else getattr(message, n, None)
+    href = str(_get("href") or _get("url") or "").lower()
+    thumb = _get("thumb") or ""
+    mtype = str(_get("type") or "").lower()
+    psticker = _get("pStickerType"); sticker_by = _get("stickerCreatedBy")
+    if psticker and str(psticker) not in ("0","None",""): return "sticker"
+    if sticker_by and str(sticker_by) not in ("None",""): return "sticker"
+    if "sticker" in href or "sticker" in mtype: return "sticker"
+    if "video" in href or "video" in mtype: return "video"
+    if any(e in href for e in (".mp4",".mov",".avi",".mkv")): return "video"
+    if "file" in mtype or "file" in href: return "file"
+    if any(e in href for e in (".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar",".7z",".apk",".txt")): return "file"
+    if "image" in mtype or "image" in href: return "image"
+    if any(e in href for e in (".jpg",".jpeg",".png",".gif",".webp",".bmp")): return "image"
+    if thumb: return "image"
+    return None
+
+LINK_PATTERN = re.compile(r"(https?://\S+|www\.\S+|\S+\.(com|vn|net|org|io|co|me|info|xyz|top|link|site|online|app|dev|fun|club)\b)", re.IGNORECASE)
+def contains_link(text): return bool(LINK_PATTERN.search(text)) if text else False
+
+def extract_mentions(obj):
+    if obj is None: return []
+    uids = []; raw = None
+    for k in ("mention","mentions","mentions_data","mentionsData"):
+        v = obj.get(k) if isinstance(obj, dict) else getattr(obj, k, None)
+        if v: raw = v; break
+    if not raw: return []
+    lst = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    for m in lst:
+        uid = None
+        if isinstance(m, dict):
+            for k in ("uid","userId","user_id","id","uidFrom"):
+                if m.get(k): uid = m[k]; break
+        else:
+            for k in ("uid","userId","user_id","id","uidFrom"):
+                v = getattr(m, k, None)
+                if v: uid = v; break
+        if uid: uids.append(str(uid))
+    return uids
+
+def extract_target_uid(ctext, obj, bot_uid):
+    for uid in extract_mentions(obj):
+        if str(uid) != str(bot_uid): return uid
+    m = re.search(r'@?(\d{8,})', ctext)
+    if m: return m.group(1)
+    return None
+
+def get_msg_id(obj):
+    if obj is None: return None
+    for k in ("msgId","msg_id","message_id","globalMsgId","global_msg_id","id"):
+        v = obj.get(k) if isinstance(obj, dict) else getattr(obj, k, None)
+        if v: return str(v)
+    return None
+
+def get_client_msg_id(obj):
+    if obj is None: return None
+    for k in ("cliMsgId","cli_msg_id","clientMsgId","client_msg_id"):
+        v = obj.get(k) if isinstance(obj, dict) else getattr(obj, k, None)
+        if v: return str(v)
+    return None
+
+def delete_message(bot, obj, tid, ttype, author_id=None):
+    if obj is None: return False
+    msg_id = get_msg_id(obj); cli_id = get_client_msg_id(obj)
+    if not msg_id or not hasattr(bot, "deleteGroupMsg"): return False
+    for owner in ([author_id, BOT_OWNER_ID, msg_id] if author_id else [BOT_OWNER_ID, msg_id]):
+        for cli in (cli_id, None):
+            try:
+                bot.deleteGroupMsg(msg_id, str(owner), cli, tid); return True
+            except Exception: pass
+    return False
+
+def _try(bot, methods, sigs, label):
+    for mname in methods:
+        if not hasattr(bot, mname): continue
+        method = getattr(bot, mname)
+        for desc, args in sigs:
+            try:
+                if isinstance(args, dict): method(**args)
+                else: method(*args)
+                return True
+            except Exception: pass
+    return False
+
+def kick_user(bot, gid, uid):
+    if not uid or str(uid) == str(BOT_OWNER_ID): return False
+    return _try(bot, ["removeUserFromGroup","kickUser","removeUser","kickMember","removeMember","removeGroupMember"],
+        [("(uid,gid)", (uid, gid)), ("(gid,uid)", (gid, uid)), ("kw", {"userId": uid, "groupId": gid})], "KICK")
+
+def add_user_to_group(bot, gid, uid):
+    if not uid: return False
+    return _try(bot, ["addUserToGroup","addUser","inviteUserToGroup","addGroupMember","addMember"],
+        [("(uid,gid)", (uid, gid)), ("(gid,uid)", (gid, uid)), ("kw", {"userId": uid, "groupId": gid})], "ADD")
+
+def promote_admin(bot, gid, uid):
+    if not uid: return False
+    return _try(bot, ["addGroupAdmins","addAdminToGroup","promoteUser","addAdmin"],
+        [("([uid],gid)", ([uid], gid)), ("(uid,gid)", (uid, gid)), ("kw", {"userId": uid, "groupId": gid})], "PROMOTE")
+
+def demote_admin(bot, gid, uid):
+    if not uid: return False
+    return _try(bot, ["removeGroupAdmins","removeAdminFromGroup","demoteUser","removeAdmin"],
+        [("([uid],gid)", ([uid], gid)), ("(uid,gid)", (uid, gid)), ("kw", {"userId": uid, "groupId": gid})], "DEMOTE")
+
+def rename_group(bot, gid, new_name):
+    return _try(bot, ["changeGroupName","renameGroup","updateGroupName","setGroupName"],
+        [("(name,gid)", (new_name, gid)), ("(gid,name)", (gid, new_name)), ("kw", {"name": new_name, "groupId": gid})], "RENAME")
+
+def _get_group_data(bot, gid):
+    info = None
+    for mn in ("fetchGroupInfo","getGroupInfo","get_group_info","getGroupInfoById"):
+        if hasattr(bot, mn):
+            try:
+                info = getattr(bot, mn)(gid); break
+            except Exception: continue
+    if info is None: return None
+    grid = info.get("gridInfoMap") if isinstance(info, dict) else getattr(info, "gridInfoMap", None)
+    if grid is None: return info
+    if isinstance(grid, dict) and grid:
+        return list(grid.values())[0]
+    if hasattr(grid, "items"):
+        try: return list(grid.items())[0][1]
+        except Exception: pass
+    return grid
+
+def is_group_admin(bot, gid, uid):
+    if str(uid) == str(BOT_OWNER_ID): return True
+    try:
+        gd = _get_group_data(bot, gid)
+        if gd is None: return False
+        creator = None
+        for k in ("creatorId","creator_id","creator","ownerId"):
+            v = gd.get(k) if isinstance(gd, dict) else getattr(gd, k, None)
+            if v: creator = v; break
+        admins = []
+        for k in ("adminIds","admin_ids","admins"):
+            v = gd.get(k) if isinstance(gd, dict) else getattr(gd, k, None)
+            if v: admins = v; break
+        if str(creator) == str(uid): return True
+        if isinstance(admins, (list, tuple)) and any(str(a) == str(uid) for a in admins): return True
+    except Exception: pass
+    return False
+
+LINE = "─" * 30
+DOT = "▸"; DIAMOND = "◆"; STAR = "★"; ARROW = "→"
+GREEN = "🟢"; RED = "🔴"; OK = "✅"; FAIL = "❌"; WARN = "⚠️"; INFO = "ℹ️"; LOCK = "🔒"; ROBOT = "🤖"
+
+COMMANDS = {
+    "help":"Menu chính","menu":"Menu chính","menuad":"Menu Admin","minigame":"Menu Mini Game",
+    "info":"Info bot","ping":"Độ trễ","uptime":"Uptime","test":"Test",
+    "capquyen":"[Owner] Cấp quyền","thuquyen":"[Owner] Thu quyền","dsquyen":"DS quyền",
+    "sleep":"[Owner] Bot ngủ","boton":"[Owner] Đánh thức","botoff":"[Owner] Tắt bot",
+    "war":"[Owner] Spam war (file)","chui":"[Owner] Chửi user (file)","spam":"[Owner] Spam tin nhắn",
+    "stop":"[Owner] Dừng war/chửi/spam","anh":"[Owner] Gửi ảnh local","voice":"[Owner] Gửi voice từ file",
+    "copy":"[Owner] Copy user","uncopy":"[Owner] Ngừng copy","dscopy":"DS copy",
+    "mute":"[Admin] Khóa chat","muteid":"[Admin] Khóa chat (UID)","unmute":"[Admin] Mở khóa","dsmute":"DS mute","checkmute":"Debug UID",
+    "debuggroup":"[Owner] Debug raw data nhóm","debugmem":"[Owner] In từng key nhóm",
+    "groupinfo":"Xem info nhóm","setname":"[Admin] Đổi tên nhóm",
+    "kick":"[Admin] Kick TV","adduser":"[Admin] Thêm TV","promote":"[Admin] Bổ nhiệm phó nhóm","demote":"[Admin] Giáng phó nhóm",
+    "antilink":"[Admin] Chặn link","antiimage":"[Admin] Chặn ảnh","antivideo":"[Admin] Chặn video","antifile":"[Admin] Chặn file",
+    "lock":"[Admin] Khóa chat nhóm","unlock":"[Admin] Mở khóa chat nhóm","settings":"Xem cài đặt",
+    "dice":"Tung xúc xắc (1-6)","coin":"Lật đồng xu","rps":"Oẳn tù tì (kéo/búa/bao)","doanso":"Đoán số 1-100",
+    "8ball":"Bói toán yes/no","rate":"Đánh giá 1-10","rand":"Random số (a b)","chon":"Chọn ngẫu nhiên (a | b | c)",
+    "daovang":"Đảo vàng","tuvan":"Tư vấn ngẫu nhiên",
+    "taosticker":"Tạo sticker từ ảnh (reply/url/file)",
+    "stickerlist":"Xem DS sticker đã tạo",
+    "dssticker":"Xem DS sticker đã tạo",
+    "xoasticker":"[Owner] Xóa sticker khỏi DS (id)",
+    "guisticker":"Gửi lại sticker theo ID để lưu",
+}
+
+def handle_help(bot, tid, ttype):
+    t = "╔══════════════════════════════╗\n║      🤖  MENU CHÍNH         ║\n╚══════════════════════════════╝\n" + f"Prefix: {PREFIX}\n"
+    t += "\n┏━━━ ⚙️ HỆ THỐNG ━━━┓\n"
+    for c in ("help","menu","info","ping","uptime","test"):
+        if c in COMMANDS: t += f"  {DOT} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n┏━━━ 👑 OWNER ━━━┓\n"
+    for c in ("capquyen","thuquyen","dsquyen","sleep","boton","botoff","war","chui","spam","anh","voice","stop","copy","uncopy","dscopy"):
+        t += f"  {DIAMOND} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n┏━━━ 🛡️ MUTE ━━━┓\n"
+    for c in ("mute","muteid","unmute","dsmute"): t += f"  {DOT} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n┏━━━ 👥 NHÓM ━━━┓\n"
+    for c in ("groupinfo","setname","kick","adduser","promote","demote"): t += f"  {DOT} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n┏━━━ 🎨 STICKER ━━━┓\n"
+    for c in ("taosticker","stickerlist","dssticker","guisticker","xoasticker"): t += f"  {DOT} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+    t += f"\n{INFO} Menu khác:\n  {PREFIX}menuad   → Menu Admin\n  {PREFIX}minigame → Menu Mini Game"
+    if BOT_SLEEPING: t += f"\n\n{WARN} BOT ĐANG NGỦ — {PREFIX}boton để đánh thức"
+    send_reply(bot, tid, ttype, t)
+
+def handle_menuad(bot, tid, ttype):
+    t = "╔══════════════════════════════╗\n║      🛡️  MENU ADMIN         ║\n╚══════════════════════════════╝\n"
+    t += "\n┏━━━ 🚫 CHỐNG SPAM ━━━┓\n"
+    for c in ("antilink","antiimage","antivideo","antifile","lock","unlock","settings"): t += f"  {DOT} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+    t += f"\n{INFO} Menu khác:\n  {PREFIX}menu     → Menu chính\n  {PREFIX}minigame → Menu Mini Game"
+    send_reply(bot, tid, ttype, t)
+
+def handle_minigame(bot, tid, ttype):
+    t = "╔══════════════════════════════╗\n║      🎲  MENU MINI GAME     ║\n╚══════════════════════════════╝\n"
+    t += "\n┏━━━ 🎮 TRÒ CHƠI ━━━┓\n"
+    for c in ("dice","coin","rps","doanso","8ball","rate","rand","chon","daovang","tuvan"): t += f"  {DOT} {PREFIX}{c:<14} {ARROW}  {COMMANDS[c]}\n"
+    t += "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+    t += f"\n{INFO} Ví dụ:\n  {DOT} `{PREFIX}dice`\n  {DOT} `{PREFIX}rps kéo`\n  {DOT} `{PREFIX}doanso`\n  {DOT} `{PREFIX}chon Cơm | Phở | Bún`"
+    t += f"\n\n{INFO} Menu khác:\n  {PREFIX}menu   → Menu chính\n  {PREFIX}menuad → Menu Admin"
+    send_reply(bot, tid, ttype, t)
+
+def handle_info(bot, tid, ttype):
+    status = "💤 Ngủ" if BOT_SLEEPING else f"{GREEN} Hoạt động"
+    t = f"ℹ️ THÔNG TIN BOT\n{LINE}\n{ROBOT} Tên: {BOT_NAME}\n🆔 UID: {BOT_OWNER_ID}\n👑 Owner: {BOT_OWNER_ID}\n{PREFIX} Prefix: {PREFIX}\n⚡ Trạng thái: {status}\n{LINE}\n"
+    t += f"🐍 Python: {platform.python_version()}\n💻 OS: {platform.system()} {platform.release()}\n{LINE}\n"
+    t += f"⏱️ Uptime: {format_uptime(time.time() - START_TIME)}\n👥 Users: {len(ALLOWED_USERS)}\n🔇 Muted: {len(MUTED_USERS)}\n📋 Copy: {len(COPY_TARGETS)}\n🏘️ Nhóm: {len(GROUP_SETTINGS)}\n🎨 Sticker: {len(CUSTOM_STICKERS)}\n📅 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
+    send_reply(bot, tid, ttype, t)
+
+def handle_ping(bot, tid, ttype):
+    s = "💤" if BOT_SLEEPING else f"{GREEN}"
+    send_reply(bot, tid, ttype, f"{ROBOT} 🏓 PONG!\n{LINE}\n▸ Trạng thái: {s}")
+
+def handle_uptime(bot, tid, ttype):
+    send_reply(bot, tid, ttype, f"{INFO} UPTIME\n{LINE}\n▸ Đã chạy: {format_uptime(time.time() - START_TIME)}")
+
+def handle_test(bot, tid, ttype):
+    send_reply(bot, tid, ttype, f"{OK} BOT HOẠT ĐỘNG\n{LINE}\n▸ UID: {BOT_OWNER_ID}")
+
+def handle_sleep(bot, tid, ttype, uid):
+    global BOT_SLEEPING
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    if BOT_SLEEPING: send_reply(bot, tid, ttype, f"{WARN} Bot đang ngủ rồi!"); return
+    BOT_SLEEPING = True
+    send_reply(bot, tid, ttype, f"💤 BOT ĐÃ NGỦ\n▸ Dùng {PREFIX}boton để đánh thức")
+
+def handle_boton(bot, tid, ttype, uid):
+    global BOT_SLEEPING
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    if not BOT_SLEEPING: send_reply(bot, tid, ttype, f"{WARN} Bot đang thức rồi!"); return
+    BOT_SLEEPING = False
+    send_reply(bot, tid, ttype, f"☀️ BOT ĐÃ THỨC\n▸ Gõ {PREFIX}menu để xem menu")
+
+def handle_botoff(bot, tid, ttype, uid):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    send_reply(bot, tid, ttype, f"🛑 BOT ĐANG TẮT...\n👋 Tạm biệt!")
+    time.sleep(2); os._exit(0)
+
+def handle_capquyen(bot, tid, ttype, data, uid, ctext):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}capquyen @user"); return
+    if str(target) == str(BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{WARN} Không cần cấp!"); return
+    if str(target) in ALLOWED_USERS: send_reply(bot, tid, ttype, f"{WARN} Đã có quyền!"); return
+    ALLOWED_USERS[str(target)] = {"granted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "granted_by": str(uid)}
+    save_json(PERM_FILE, ALLOWED_USERS)
+    send_reply(bot, tid, ttype, f"{OK} ĐÃ CẤP QUYỀN\n▸ User: {target}\n▸ Tổng: {len(ALLOWED_USERS)}")
+
+def handle_thuquyen(bot, tid, ttype, data, uid, ctext):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}thuquyen @user"); return
+    if str(target) not in ALLOWED_USERS: send_reply(bot, tid, ttype, f"{WARN} Chưa có quyền!"); return
+    del ALLOWED_USERS[str(target)]; save_json(PERM_FILE, ALLOWED_USERS)
+    send_reply(bot, tid, ttype, f"🗑️ ĐÃ THU QUYỀN\n▸ User: {target}")
+
+def handle_dsquyen(bot, tid, ttype, uid):
+    if not is_user_allowed(uid): send_reply(bot, tid, ttype, f"{LOCK} Không có quyền!"); return
+    t = f"👥 DS QUYỀN\n{LINE}\n👑 Owner: {BOT_OWNER_ID}"
+    if not ALLOWED_USERS: t += f"\n\n{INFO} Chưa có ai."
+    else:
+        for i, u in enumerate(ALLOWED_USERS.keys(), 1): t += f"\n{DOT} {i}. {u}"
+    send_reply(bot, tid, ttype, t)
+
+def handle_mute(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}mute @user"); return
+    if str(target) in MUTED_USERS: send_reply(bot, tid, ttype, f"{WARN} Đã bị mute!"); return
+    MUTED_USERS[str(target)] = {"muted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "muted_by": str(uid), "group_id": str(tid)}
+    save_json(MUTE_FILE, MUTED_USERS)
+    send_reply(bot, tid, ttype, f"🔇 ĐÃ MUTE\n▸ User: {target}")
+
+def handle_muteid(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    parts = ctext.split()
+    if len(parts) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}muteid <UID>"); return
+    tgt = parts[1].strip()
+    if not tgt.isdigit(): send_reply(bot, tid, ttype, f"{FAIL} UID không hợp lệ!"); return
+    if str(tgt) in MUTED_USERS: send_reply(bot, tid, ttype, f"{WARN} Đã bị mute!"); return
+    MUTED_USERS[str(tgt)] = {"muted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "muted_by": str(uid), "group_id": str(tid)}
+    save_json(MUTE_FILE, MUTED_USERS)
+    send_reply(bot, tid, ttype, f"🔇 ĐÃ MUTE UID {tgt}")
+
+def handle_unmute(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}unmute @user"); return
+    if str(target) not in MUTED_USERS: send_reply(bot, tid, ttype, f"{WARN} Chưa bị mute!"); return
+    del MUTED_USERS[str(target)]; save_json(MUTE_FILE, MUTED_USERS)
+    send_reply(bot, tid, ttype, f"🔊 ĐÃ UNMUTE\n▸ User: {target}")
+
+def handle_dsmute(bot, tid, ttype, uid):
+    if not is_user_allowed(uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{LOCK} Không có quyền!"); return
+    t = f"🔇 DS MUTE\n{LINE}"
+    if not MUTED_USERS: t += f"\n\n{INFO} Chưa có ai."
+    else:
+        for i, u in enumerate(MUTED_USERS.keys(), 1): t += f"\n{DOT} {i}. {u}"
+    send_reply(bot, tid, ttype, t)
+
+def handle_checkmute(bot, tid, ttype, data, uid, ctext):
+    if not is_owner(uid) and not is_group_admin(bot, tid, uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner/Admin!"); return
+    mentions = extract_mentions(data.get("raw"))
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    t = f"🔍 CHECK MUTE\n{LINE}\n▸ UID mention : {mentions}\n▸ UID extract : {target}\n▸ Trong DS    : {'✅' if target and str(target) in MUTED_USERS else '❌'}\n\n📋 DS ({len(MUTED_USERS)}):\n"
+    for i, u in enumerate(MUTED_USERS.keys(), 1): t += f"  {i}. {u}\n"
+    send_reply(bot, tid, ttype, t)
+
+def handle_debuggroup(bot, tid, ttype, uid):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    t = f"🔍 DEBUG GROUP V2\n{LINE}\n"
+    info = None; method_used = None
+    for mn in ("fetchGroupInfo", "getGroupInfo", "getGroupInfoById", "get_group_info"):
+        if hasattr(bot, mn):
+            try:
+                info = getattr(bot, mn)(tid); method_used = mn; break
+            except Exception as e: print(f"[DEBUG] {mn} lỗi: {e}"); continue
+    if info is None: send_reply(bot, tid, ttype, f"{FAIL} Không lấy được info!"); return
+    t += f"▸ Method: `{method_used}`\n▸ Type: `{type(info).__name__}`\n\n"
+    grid = info.get("gridInfoMap") if isinstance(info, dict) else getattr(info, "gridInfoMap", None)
+    if grid is None: t += f"{FAIL} Không có gridInfoMap!"; send_reply(bot, tid, ttype, t); return
+    t += f"📦 gridInfoMap type: `{type(grid).__name__}`\n"
+    if isinstance(grid, dict):
+        t += f"▸ Số key trong grid: {len(grid)}\n\n"; send_reply(bot, tid, ttype, t); time.sleep(1)
+        for key, val in list(grid.items())[:3]:
+            tx = f"━━━ KEY: `{key}` ━━━\n▸ Type value: `{type(val).__name__}`\n"
+            if isinstance(val, dict):
+                tx += f"▸ Keys ({len(val)}):\n"
+                for k in list(val.keys())[:40]:
+                    v = val[k]
+                    if isinstance(v, (list, tuple)): tx += f"  • `{k}` = <{type(v).__name__}[{len(v)}]>\n"
+                    elif isinstance(v, dict): tx += f"  • `{k}` = <dict {len(v)}>\n"
+                    else: tx += f"  • `{k}` = {str(v)[:80]}\n"
+            else:
+                attrs = [a for a in dir(val) if not a.startswith("_")]
+                tx += f"▸ Attributes ({len(attrs)}):\n"
+                for a in attrs[:40]:
+                    try:
+                        v = getattr(val, a)
+                        if callable(v): continue
+                        if isinstance(v, (list, tuple)): tx += f"  • `{a}` = <{type(v).__name__}[{len(v)}]>\n"
+                        elif isinstance(v, dict): tx += f"  • `{a}` = <dict {len(v)}>\n"
+                        else: tx += f"  • `{a}` = {str(v)[:80]}\n"
+                    except Exception: pass
+            send_reply(bot, tid, ttype, tx); time.sleep(1.5)
+    else:
+        attrs = [a for a in dir(grid) if not a.startswith("_")]
+        t += f"▸ Attributes của grid ({len(attrs)}):\n"
+        for a in attrs[:40]:
+            try:
+                v = getattr(grid, a)
+                if callable(v): continue
+                if isinstance(v, (list, tuple)): t += f"  • `{a}` = <{type(v).__name__}[{len(v)}]>\n"
+                elif isinstance(v, dict): t += f"  • `{a}` = <dict {len(v)}>\n"
+                else: t += f"  • `{a}` = {str(v)[:80]}\n"
+            except Exception: pass
+        send_reply(bot, tid, ttype, t)
+
+def handle_debugmem(bot, tid, ttype, uid):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    info = None
+    for mn in ("fetchGroupInfo", "getGroupInfo", "get_group_info"):
+        if hasattr(bot, mn):
+            try:
+                info = getattr(bot, mn)(tid); break
+            except Exception: continue
+    if info is None: send_reply(bot, tid, ttype, f"{FAIL} Không lấy được info!"); return
+    grid = info.get("gridInfoMap") if isinstance(info, dict) else getattr(info, "gridInfoMap", None)
+    if not grid or not isinstance(grid, dict):
+        send_reply(bot, tid, ttype, f"{FAIL} gridInfoMap không phải dict!"); return
+    group_data = list(grid.values())[0]
+    if group_data is None: send_reply(bot, tid, ttype, f"{FAIL} Không có GroupDetail!"); return
+    if isinstance(group_data, dict): keys = list(group_data.keys())
+    else: keys = [a for a in dir(group_data) if not a.startswith("_")]
+    chunks = [keys[i:i+10] for i in range(0, len(keys), 10)]
+    for idx, chunk in enumerate(chunks, 1):
+        tx = f"📋 KEYS ({idx}/{len(chunks)}) — {len(chunk)} keys\n{LINE}\n"
+        for k in chunk:
+            try:
+                v = group_data.get(k) if isinstance(group_data, dict) else getattr(group_data, k, None)
+                if callable(v): continue
+                if isinstance(v, (list, tuple)):
+                    tx += f"▸ `{k}` = <{type(v).__name__}[{len(v)}]>"
+                    if v and len(str(v[0])) < 80: tx += f"  vd: {str(v[:2])[:60]}"
+                    tx += "\n"
+                elif isinstance(v, dict):
+                    tx += f"▸ `{k}` = <dict {len(v)}>  keys: {list(v.keys())[:3]}\n"
+                else:
+                    tx += f"▸ `{k}` = {str(v)[:100]}\n"
+            except Exception: pass
+        send_reply(bot, tid, ttype, tx); time.sleep(1.5)
+
+def war_worker(bot, tid, ttype, lines, delay):
+    try:
+        send_reply(bot, tid, ttype, f"⚔️ BẮT ĐẦU WAR\n▸ Số câu: {len(lines)}\n▸ Delay: {delay}s")
+        i = 0
+        while WAR_RUNNING.get(tid):
+            bot_send(bot, tid, ttype, lines[i % len(lines)], skip_delay=True); i += 1
+            if delay > 0: time.sleep(delay)
+        send_reply(bot, tid, ttype, f"🛑 DỪNG WAR\n▸ Đã gửi: {i} tin")
+    except Exception as e: print(f"[WAR] Lỗi: {e}"); WAR_RUNNING[tid] = False
+
+def handle_war(bot, tid, ttype, uid, args):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    if WAR_RUNNING.get(tid): send_reply(bot, tid, ttype, f"{WARN} War đang chạy!\nGõ {PREFIX}stop"); return
+    delay = WAR_DELAY_DEFAULT
+    if args:
+        try:
+            delay = float(str(args[0]).replace(",", "."))
+            if delay < WAR_DELAY_MIN or delay > WAR_DELAY_MAX: send_reply(bot, tid, ttype, f"{WARN} Delay từ {WAR_DELAY_MIN} - {WAR_DELAY_MAX}s!"); return
+        except ValueError: send_reply(bot, tid, ttype, f"{FAIL} Delay không hợp lệ!"); return
+    if not os.path.exists(WAR_FILE): send_reply(bot, tid, ttype, f"{FAIL} Không có {WAR_FILE}!"); return
+    try:
+        with open(WAR_FILE, "r", encoding="utf-8") as f: lines = [l.strip() for l in f if l.strip()]
+        if not lines: send_reply(bot, tid, ttype, f"{FAIL} File rỗng!"); return
+    except Exception as e: send_reply(bot, tid, ttype, f"{FAIL} Lỗi đọc file: {e}"); return
+    WAR_PENDING[tid] = {"delay": delay, "user_id": str(uid), "time": time.time(), "lines": lines}
+    t = f"⚠️ XÁC NHẬN WAR\n{LINE}\n▸ Số câu: {len(lines)}\n▸ Delay: {delay}s\n\n{ARROW} Reply: yes / ok / có → Bắt đầu\n{ARROW} Reply: no / hủy → Hủy\n⏱️ Tự hủy sau {WAR_CONFIRM_TIMEOUT}s"
+    send_reply(bot, tid, ttype, t)
+
+def chui_worker(bot, tid, ttype, target_uid, target_name, lines, delay):
+    try:
+        send_reply(bot, tid, ttype, f"🔥 BẮT ĐẦU CHỬI\n▸ Target: {target_name} ({target_uid})\n▸ Số câu: {len(lines)}\n▸ Delay: {delay}s")
+        i = 0
+        while CHUI_RUNNING.get(tid):
+            bot_send_mention(bot, tid, ttype, lines[i % len(lines)], target_uid); i += 1
+            if delay > 0: time.sleep(delay)
+        send_reply(bot, tid, ttype, f"🛑 DỪNG CHỬI\n▸ Đã gửi: {i} tin")
+    except Exception as e: print(f"[CHUI] Lỗi: {e}"); CHUI_RUNNING[tid] = False
+
+def handle_chui(bot, tid, ttype, uid, args, ctext, data):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    if CHUI_RUNNING.get(tid): send_reply(bot, tid, ttype, f"{WARN} Đang chửi rồi!\nGõ {PREFIX}stop"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target:
+        m = re.search(r'@?(\d{8,})', ctext)
+        if m: target = m.group(1)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}chui @user [delay]"); return
+    if str(target) == str(BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{WARN} Không thể tự chửi bot!"); return
+    target_name = target
+    try:
+        info = None
+        for mn in ("getUserInfo", "fetchUserInfo", "get_user_info"):
+            if hasattr(bot, mn):
+                try: info = getattr(bot, mn)(target); break
+                except Exception: continue
+        if info:
+            if isinstance(info, dict): target_name = info.get("name") or info.get("displayName") or info.get("zaloName") or target
+            else: target_name = getattr(info, "name", None) or getattr(info, "displayName", None) or target
+    except Exception: pass
+    delay = CHUI_DELAY_DEFAULT
+    for p in ctext.split():
+        try:
+            val = float(p.replace(",", "."))
+            if CHUI_DELAY_MIN <= val <= CHUI_DELAY_MAX: delay = val; break
+        except ValueError: continue
+    if not os.path.exists(CHUI_FILE): send_reply(bot, tid, ttype, f"{FAIL} Không có file {CHUI_FILE}!"); return
+    try:
+        with open(CHUI_FILE, "r", encoding="utf-8") as f: lines = [l.strip() for l in f if l.strip()]
+        if not lines: send_reply(bot, tid, ttype, f"{FAIL} File rỗng!"); return
+    except Exception as e: send_reply(bot, tid, ttype, f"{FAIL} Lỗi đọc file: {e}"); return
+    CHUI_PENDING[tid] = {"delay": delay, "user_id": str(uid), "time": time.time(), "lines": lines, "target_uid": target, "target_name": target_name}
+    t = f"⚠️ XÁC NHẬN CHỬI\n{LINE}\n▸ Target: {target_name} ({target})\n▸ Số câu: {len(lines)}\n▸ Delay: {delay}s\n\n{ARROW} Reply: yes / ok / có → Bắt đầu\n{ARROW} Reply: no / hủy → Hủy\n⏱️ Tự hủy sau {WAR_CONFIRM_TIMEOUT}s"
+    send_reply(bot, tid, ttype, t)
+
+def spam_worker(bot, tid, ttype, content, target_uid, delay):
+    try:
+        target_str = f" (tag {target_uid})" if target_uid else " (không tag)"
+        send_reply(bot, tid, ttype, f"📢 BẮT ĐẦU SPAM\n▸ Nội dung: {content[:100]}\n▸ Delay: {delay}s{target_str}")
+        i = 0
+        while SPAM_RUNNING.get(tid):
+            if target_uid: bot_send_mention(bot, tid, ttype, content, target_uid)
+            else: bot_send(bot, tid, ttype, content, skip_delay=True)
+            i += 1
+            if delay > 0: time.sleep(delay)
+        send_reply(bot, tid, ttype, f"🛑 DỪNG SPAM\n▸ Đã gửi: {i} tin")
+    except Exception as e: print(f"[SPAM] Lỗi: {e}"); SPAM_RUNNING[tid] = False
+
+def handle_spam(bot, tid, ttype, uid, args, ctext, data):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    if SPAM_RUNNING.get(tid): send_reply(bot, tid, ttype, f"{WARN} Đang spam rồi!\nGõ {PREFIX}stop"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    target_name = None
+    if target:
+        try:
+            info = None
+            for mn in ("getUserInfo", "fetchUserInfo", "get_user_info"):
+                if hasattr(bot, mn):
+                    try: info = getattr(bot, mn)(target); break
+                    except Exception: continue
+            if info:
+                if isinstance(info, dict): target_name = info.get("name") or info.get("displayName") or info.get("zaloName")
+                else: target_name = getattr(info, "name", None) or getattr(info, "displayName", None)
+        except Exception: pass
+    content = ctext
+    if content.lower().startswith("spam"): content = content[4:].strip()
+    if target: content = content.replace(f"@{target}", "").strip()
+    if target_name:
+        content = content.replace(f"@{target_name}", "").strip()
+        if content.startswith(target_name): content = content[len(target_name):].strip()
+    if content.startswith("@"):
+        content = re.sub(r'^@\S+\s*', '', content).strip()
+        if content.startswith("@"): content = re.sub(r'^@\S+\s*', '', content).strip()
+    delay = SPAM_DELAY_DEFAULT
+    parts = content.split(maxsplit=1)
+    if parts:
+        try:
+            val = float(parts[0].replace(",", "."))
+            if SPAM_DELAY_MIN <= val <= SPAM_DELAY_MAX:
+                delay = val; content = parts[1] if len(parts) > 1 else ""
+        except ValueError: pass
+    content = content.strip()
+    if not content:
+        send_reply(bot, tid, ttype, f"{FAIL} Thiếu nội dung spam!\n{LINE}\n▸ Cú pháp: {PREFIX}spam @user [delay] <nội dung>")
+        return
+    SPAM_PENDING[tid] = {"delay": delay, "user_id": str(uid), "time": time.time(), "content": content, "target_uid": target}
+    target_str = f"Tag @{target}" if target else "Không tag"
+    t = f"⚠️ XÁC NHẬN SPAM\n{LINE}\n▸ Target: {target_str}\n▸ Delay: {delay}s\n▸ Nội dung: {content[:200]}\n\n{ARROW} Reply: yes / ok / có → Bắt đầu\n{ARROW} Reply: no / hủy → Hủy\n⏱️ Tự hủy sau {WAR_CONFIRM_TIMEOUT}s"
+    send_reply(bot, tid, ttype, t)
+
+def handle_stop(bot, tid, ttype, uid):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    stopped = []
+    if WAR_RUNNING.get(tid): WAR_RUNNING[tid] = False; stopped.append("WAR")
+    if CHUI_RUNNING.get(tid): CHUI_RUNNING[tid] = False; stopped.append("CHỬI")
+    if SPAM_RUNNING.get(tid): SPAM_RUNNING[tid] = False; stopped.append("SPAM")
+    if stopped: send_reply(bot, tid, ttype, f"🛑 ĐÃ DỪNG: {', '.join(stopped)}")
+    else: send_reply(bot, tid, ttype, f"{WARN} Không có gì đang chạy!")
+
+def check_war_confirmation(bot, tid, ttype, uid, text):
+    if tid in WAR_PENDING:
+        p = WAR_PENDING[tid]
+        if time.time() - p["time"] > WAR_CONFIRM_TIMEOUT: del WAR_PENDING[tid]
+        elif str(uid) == p["user_id"]:
+            txt = text.lower().strip()
+            if txt in WAR_CONFIRM_WORDS:
+                d = p["delay"]; l = p["lines"]; del WAR_PENDING[tid]; WAR_RUNNING[tid] = True
+                threading.Thread(target=war_worker, args=(bot, tid, ttype, l, d), daemon=True).start(); return True
+            if txt in WAR_CANCEL_WORDS: del WAR_PENDING[tid]; send_reply(bot, tid, ttype, f"❌ Đã hủy war."); return True
+            if not text.startswith(PREFIX): return True
+    if tid in CHUI_PENDING:
+        p = CHUI_PENDING[tid]
+        if time.time() - p["time"] > WAR_CONFIRM_TIMEOUT: del CHUI_PENDING[tid]
+        elif str(uid) == p["user_id"]:
+            txt = text.lower().strip()
+            if txt in WAR_CONFIRM_WORDS:
+                d = p["delay"]; l = p["lines"]; target = p["target_uid"]; target_name = p["target_name"]
+                del CHUI_PENDING[tid]; CHUI_RUNNING[tid] = True
+                threading.Thread(target=chui_worker, args=(bot, tid, ttype, target, target_name, l, d), daemon=True).start(); return True
+            if txt in WAR_CANCEL_WORDS: del CHUI_PENDING[tid]; send_reply(bot, tid, ttype, f"❌ Đã hủy chửi."); return True
+            if not text.startswith(PREFIX): return True
+    if tid in SPAM_PENDING:
+        p = SPAM_PENDING[tid]
+        if time.time() - p["time"] > WAR_CONFIRM_TIMEOUT: del SPAM_PENDING[tid]
+        elif str(uid) == p["user_id"]:
+            txt = text.lower().strip()
+            if txt in WAR_CONFIRM_WORDS:
+                d = p["delay"]; content = p["content"]; target = p["target_uid"]
+                del SPAM_PENDING[tid]; SPAM_RUNNING[tid] = True
+                threading.Thread(target=spam_worker, args=(bot, tid, ttype, content, target, d), daemon=True).start(); return True
+            if txt in WAR_CANCEL_WORDS: del SPAM_PENDING[tid]; send_reply(bot, tid, ttype, f"❌ Đã hủy spam."); return True
+            if not text.startswith(PREFIX): return True
+    return False
+
+def handle_anh(bot, tid, ttype, uid, args, ctext):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if not args:
+        files = []
+        try:
+            for f in os.listdir(base_dir):
+                if f.lower().endswith(IMAGE_EXTS):
+                    files.append((f, os.path.getsize(os.path.join(base_dir, f)) / 1024))
+        except Exception: pass
+        if not files: send_reply(bot, tid, ttype, f"{FAIL} Không có file ảnh!\n▸ Hỗ trợ: {', '.join(IMAGE_EXTS)}"); return
+        t = f"🖼️ DANH SÁCH ẢNH ({len(files)})\n{LINE}"
+        for i, (f, sz) in enumerate(files[:30], 1): t += f"\n{DOT} {i}. `{f}` ({sz:.1f} KB)"
+        if len(files) > 30: t += f"\n... và {len(files)-30} file khác"
+        t += f"\n\n{INFO} Dùng: `{PREFIX}anh <tên_file> [caption]`"
+        send_reply(bot, tid, ttype, t); return
+    ctext_after = ctext[len("anh"):].strip()
+    all_files = []
+    try:
+        for f in os.listdir(base_dir):
+            if f.lower().endswith(IMAGE_EXTS): all_files.append(f)
+    except Exception: pass
+    if not all_files: send_reply(bot, tid, ttype, f"{FAIL} Không có ảnh!"); return
+    filename = None; remaining = ""
+    for f in sorted(all_files, key=len, reverse=True):
+        if ctext_after.lower().startswith(f.lower()): filename = f; remaining = ctext_after[len(f):].strip(); break
+    if not filename:
+        first_word = ctext_after.split()[0] if ctext_after.split() else ""
+        for f in all_files:
+            if first_word.lower() in f.lower(): filename = f; remaining = ctext_after[len(first_word):].strip(); break
+    if not filename: send_reply(bot, tid, ttype, f"{FAIL} Không tìm thấy ảnh!\n▸ Gõ `{PREFIX}anh` để xem danh sách"); return
+    filepath = os.path.join(base_dir, filename)
+    if not os.path.exists(filepath): send_reply(bot, tid, ttype, f"{FAIL} File không tồn tại!"); return
+    if bot_send_image(bot, tid, ttype, filepath, remaining): send_reply(bot, tid, ttype, f"{OK} ĐÃ GỬI ẢNH\n▸ File: `{filename}`")
+    else: send_reply(bot, tid, ttype, f"{FAIL} Không gửi được ảnh!")
+
+def handle_voice(bot, tid, ttype, uid, args, ctext):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if not args:
+        files = []
+        try:
+            for f in os.listdir(base_dir):
+                if f.lower().endswith(VOICE_EXTS):
+                    files.append((f, os.path.getsize(os.path.join(base_dir, f)) / (1024*1024)))
+        except Exception: pass
+        if not files: send_reply(bot, tid, ttype, f"{FAIL} Không có file âm thanh!\n▸ Hỗ trợ: {', '.join(VOICE_EXTS)}"); return
+        t = f"🎵 DANH SÁCH NHẠC ({len(files)})\n{LINE}"
+        for i, (f, sz) in enumerate(files[:30], 1): t += f"\n{DOT} {i}. `{f}` ({sz:.1f} MB)"
+        if len(files) > 30: t += f"\n... và {len(files)-30} file khác"
+        t += f"\n\n{INFO} Dùng: `{PREFIX}voice <tên file>`"
+        send_reply(bot, tid, ttype, t); return
+    filename = ctext[len("voice"):].strip()
+    filepath = os.path.join(base_dir, filename)
+    if not os.path.exists(filepath):
+        try:
+            for f in os.listdir(base_dir):
+                if f.lower().endswith(VOICE_EXTS) and filename.lower() in f.lower(): filepath = os.path.join(base_dir, f); break
+        except Exception: pass
+    if not os.path.exists(filepath): send_reply(bot, tid, ttype, f"{FAIL} Không tìm thấy file!"); return
+    if not filepath.lower().endswith(VOICE_EXTS): send_reply(bot, tid, ttype, f"{WARN} File không phải âm thanh!"); return
+
+    actual_name = os.path.basename(filepath)
+    file_size = os.path.getsize(filepath)
+    if file_size < 5000:
+        send_reply(bot, tid, ttype,
+            f"{FAIL} File quá nhỏ ({file_size} bytes)!\n"
+            f"▸ Có thể file bị lỗi hoặc rỗng.\n"
+            f"▸ Thử file audio khác (> 10KB)")
+        return
+
+    send_reply(bot, tid, ttype, f"🔄 Đang upload `{actual_name}` ({file_size/1024:.1f} KB)...")
+    url = upload_voice_smart(filepath)
+    if not url:
+        send_reply(bot, tid, ttype, f"{FAIL} Upload thất bại (đã thử catbox + uguu + tmpfiles)!"); return
+
+    send_reply(bot, tid, ttype, f"📤 Đang gửi voice...")
+    r = bot_send_voice(bot, tid, ttype, url)
+    if r: send_reply(bot, tid, ttype, f"{OK} ĐÃ GỬI VOICE\n▸ File: `{actual_name}`")
+    else: send_reply(bot, tid, ttype,
+        f"{WARN} Không gửi voice được!\n"
+        f"▸ URL: {url}\n"
+        f"▸ Xem log terminal [VOICE] để biết chi tiết")
+
+def handle_copy(bot, tid, ttype, data, uid, ctext):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}copy @user"); return
+    if str(target) in COPY_TARGETS: send_reply(bot, tid, ttype, f"{WARN} Đang copy!"); return
+    COPY_TARGETS[str(target)] = {"added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "added_by": str(uid), "msg_map": {}}
+    save_json(COPY_FILE, COPY_TARGETS)
+    send_reply(bot, tid, ttype, f"📋 ĐÃ BẬT COPY\n▸ User: {target}")
+
+def handle_uncopy(bot, tid, ttype, data, uid, ctext):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}uncopy @user"); return
+    if str(target) not in COPY_TARGETS: send_reply(bot, tid, ttype, f"{WARN} Chưa bật copy!"); return
+    del COPY_TARGETS[str(target)]; save_json(COPY_FILE, COPY_TARGETS)
+    send_reply(bot, tid, ttype, f"📋 ĐÃ TẮT COPY\n▸ User: {target}")
+
+def handle_dscopy(bot, tid, ttype, uid):
+    if not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    t = f"📋 DS COPY\n{LINE}"
+    if not COPY_TARGETS: t += f"\n\n{INFO} Chưa copy ai."
+    else:
+        for i, u in enumerate(COPY_TARGETS.keys(), 1): t += f"\n{DOT} {i}. {u}"
+    send_reply(bot, tid, ttype, t)
+
+def do_copy_message(bot, src_uid, text, tid, ttype, src_mid):
+    if not text: return
+    try:
+        result = bot_send(bot, tid, ttype, text)
+        bot_mid = get_msg_id(result) if result else None
+        if src_mid and bot_mid:
+            COPY_TARGETS.setdefault(str(src_uid), {}).setdefault("msg_map", {})[str(src_mid)] = str(bot_mid)
+            save_json(COPY_FILE, COPY_TARGETS)
+    except Exception as e: print(f"[COPY] Lỗi: {e}")
+
+def do_undo_copy(src_mid, tid, ttype):
+    for uid, info in COPY_TARGETS.items():
+        mm = info.get("msg_map", {}) if isinstance(info, dict) else {}
+        if str(src_mid) in mm:
+            bot_mid = mm[str(src_mid)]
+            try:
+                fake = {"msgId": bot_mid}
+                if Message is not None:
+                    try: fake = Message(msgId=bot_mid)
+                    except Exception: pass
+                delete_message(bot, fake, tid, ttype, author_id=BOT_OWNER_ID)
+                del mm[str(src_mid)]; save_json(COPY_FILE, COPY_TARGETS)
+            except Exception: pass
+            return True
+    return False
+
+def handle_groupinfo(bot, tid, ttype):
+    info = None; method_used = None
+    for mn in ("fetchGroupInfo", "getGroupInfo", "get_group_info", "getGroupInfoById"):
+        if hasattr(bot, mn):
+            try:
+                info = getattr(bot, mn)(tid); method_used = mn; break
+            except Exception: continue
+
+    t = f"👥 THÔNG TIN NHÓM\n{LINE}"
+    if info is None:
+        t += f"\n{WARN} Không lấy được info!\n{INFO} Thử gõ {PREFIX}debuggroup"
+        send_reply(bot, tid, ttype, t); return
+
+    grid = None
+    if isinstance(info, dict): grid = info.get("gridInfoMap")
+    else: grid = getattr(info, "gridInfoMap", None)
+    if grid is None:
+        t += f"\n{WARN} Không có gridInfoMap!"
+        send_reply(bot, tid, ttype, t); return
+
+    group_data = None
+    if isinstance(grid, dict) and grid: group_data = list(grid.values())[0]
+    elif hasattr(grid, "items"):
+        try: group_data = list(grid.items())[0][1]
+        except Exception: pass
+    else: group_data = grid
+    if group_data is None:
+        t += f"\n{WARN} Không lấy được GroupDetail!"
+        send_reply(bot, tid, ttype, t); return
+
+    def gf(obj, *keys):
+        for k in keys:
+            try:
+                v = obj.get(k) if isinstance(obj, dict) else getattr(obj, k, None)
+                if v is not None and v != "": return v
+            except Exception: pass
+        return None
+
+    name = gf(group_data, "name", "groupName", "group_name") or "?"
+    creator = gf(group_data, "creatorId", "creator_id", "creator", "ownerId") or "?"
+    desc = gf(group_data, "desc", "description") or "(trống)"
+    total = gf(group_data, "totalMember", "memberCount", "total_member", "totalMembers")
+    admin_ids = gf(group_data, "adminIds", "admin_ids", "admins") or []
+    member_ids = gf(group_data, "memberIds", "member_ids", "members") or []
+
+    t += f"\n▸ Tên nhóm : {name}"
+    t += f"\n▸ Nhóm ID  : {tid}"
+    t += f"\n▸ Chủ nhóm : {creator}"
+    t += f"\n▸ Mô tả    : {str(desc)[:80]}"
+    if isinstance(total, int): t += f"\n▸ Tổng TV  : {total}"
+    elif member_ids: t += f"\n▸ Tổng TV  : {len(member_ids)}"
+    elif isinstance(admin_ids, (list, tuple)) and admin_ids: t += f"\n▸ Tổng TV  : ~{len(admin_ids)} admin"
+    else: t += f"\n▸ Tổng TV  : ?"
+    if admin_ids and isinstance(admin_ids, (list, tuple)): t += f"\n▸ Phó nhóm : {len(admin_ids)}"
+    t += f"\n▸ Method   : `{method_used}`"
+
+    gs = get_group_settings(tid)
+    t += f"\n\n📋 CÀI ĐẶT:"
+    t += f"\n▸ Anti-link  : {'✅ BẬT' if gs['antilink'] else '❌ TẮT'}"
+    t += f"\n▸ Anti-ảnh   : {'✅ BẬT' if gs['antiimage'] else '❌ TẮT'}"
+    t += f"\n▸ Anti-video : {'✅ BẬT' if gs['antivideo'] else '❌ TẮT'}"
+    t += f"\n▸ Anti-file  : {'✅ BẬT' if gs['antifile'] else '❌ TẮT'}"
+    t += f"\n▸ Lock nhóm  : {'✅ BẬT' if gs['lock'] else '❌ TẮT'}"
+    send_reply(bot, tid, ttype, t)
+
+def handle_setname(bot, tid, ttype, uid, ctext):
+    if not is_group_admin(bot, tid, uid): send_reply(bot, tid, ttype, f"{FAIL} Cần CHỦ/PHÓ NHÓM!"); return
+    parts = ctext.split(maxsplit=1)
+    if len(parts) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}setname <tên mới>"); return
+    new_name = parts[1].strip()
+    if not new_name: send_reply(bot, tid, ttype, f"{FAIL} Tên rỗng!"); return
+    ok = rename_group(bot, tid, new_name)
+    send_reply(bot, tid, ttype, f"{OK} ĐÃ ĐỔI TÊN NHÓM\n▸ {new_name}" if ok else f"{FAIL} Không đổi được!")
+
+def handle_kick(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}kick @user"); return
+    if str(target) == str(BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{WARN} Không kick bot!"); return
+    ok = kick_user(bot, tid, target)
+    send_reply(bot, tid, ttype, f"{OK} ĐÃ KICK\n▸ User: {target}" if ok else f"{FAIL} Không kick được!")
+
+def handle_adduser(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    m = re.search(r'(\d{8,})', ctext)
+    if not m: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}adduser <UID>"); return
+    target = m.group(1)
+    ok = add_user_to_group(bot, tid, target)
+    send_reply(bot, tid, ttype, f"{OK} ĐÃ THÊM\n▸ User: {target}" if ok else f"{FAIL} Không thêm được!")
+
+def handle_promote(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid): send_reply(bot, tid, ttype, f"{FAIL} Cần CHỦ/PHÓ NHÓM!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}promote @user"); return
+    ok = promote_admin(bot, tid, target)
+    send_reply(bot, tid, ttype, f"{OK} ĐÃ BỔ NHIỆM\n▸ User: {target}" if ok else f"{FAIL} Không bổ nhiệm được!")
+
+def handle_demote(bot, tid, ttype, data, uid, ctext):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid): send_reply(bot, tid, ttype, f"{FAIL} Cần CHỦ/PHÓ NHÓM!"); return
+    target = extract_target_uid(ctext, data.get("raw"), BOT_OWNER_ID)
+    if not target: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}demote @user"); return
+    ok = demote_admin(bot, tid, target)
+    send_reply(bot, tid, ttype, f"{OK} ĐÃ GIÁNG\n▸ User: {target}" if ok else f"{FAIL} Không giáng được!")
+
+def _toggle(bot, tid, ttype, uid, key, label):
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Cần CHỦ/PHÓ NHÓM!"); return
+    gs = get_group_settings(tid); gs[key] = not gs[key]; save_group_settings()
+    send_reply(bot, tid, ttype, f"⚙️ {label}: {'✅ BẬT' if gs[key] else '❌ TẮT'}")
+
+def handle_antilink(bot, tid, ttype, uid):   _toggle(bot, tid, ttype, uid, "antilink", "Chặn LINK")
+def handle_antiimage(bot, tid, ttype, uid):  _toggle(bot, tid, ttype, uid, "antiimage", "Chặn ẢNH")
+def handle_antivideo(bot, tid, ttype, uid):  _toggle(bot, tid, ttype, uid, "antivideo", "Chặn VIDEO")
+def handle_antifile(bot, tid, ttype, uid):   _toggle(bot, tid, ttype, uid, "antifile", "Chặn FILE")
+
+def handle_lock(bot, tid, ttype, uid):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    gs = get_group_settings(tid); gs["lock"] = not gs["lock"]; save_group_settings()
+    if gs["lock"]: send_reply(bot, tid, ttype, f"{LOCK} ĐÃ KHÓA NHÓM\n▸ Chỉ admin gửi được tin")
+    else: send_reply(bot, tid, ttype, f"🔓 ĐÃ MỞ KHÓA NHÓM")
+
+def handle_unlock(bot, tid, ttype, uid):
+    if not is_group_admin(bot, tid, BOT_OWNER_ID): send_reply(bot, tid, ttype, f"{FAIL} Bot cần PHÓ NHÓM!"); return
+    if not is_group_admin(bot, tid, uid) and not is_owner(uid): send_reply(bot, tid, ttype, f"{FAIL} Bạn cần CHỦ/PHÓ NHÓM!"); return
+    gs = get_group_settings(tid)
+    if not gs["lock"]: send_reply(bot, tid, ttype, f"{WARN} Nhóm đang không khóa!"); return
+    gs["lock"] = False; save_group_settings()
+    send_reply(bot, tid, ttype, f"🔓 ĐÃ MỞ KHÓA NHÓM")
+
+def handle_settings(bot, tid, ttype):
+    gs = get_group_settings(tid)
+    t = f"⚙️ CÀI ĐẶT NHÓM\n{LINE}\n"
+    t += f"▸ Anti-link  : {'✅ BẬT' if gs['antilink'] else '❌ TẮT'}\n"
+    t += f"▸ Anti-ảnh   : {'✅ BẬT' if gs['antiimage'] else '❌ TẮT'}\n"
+    t += f"▸ Anti-video : {'✅ BẬT' if gs['antivideo'] else '❌ TẮT'}\n"
+    t += f"▸ Anti-file  : {'✅ BẬT' if gs['antifile'] else '❌ TẮT'}\n"
+    t += f"▸ Lock nhóm  : {'✅ BẬT' if gs['lock'] else '❌ TẮT'}\n"
+    send_reply(bot, tid, ttype, t)
+
+_DL_LOGS = []
+
+def _extract_image_url(data):
+    if not data: return None
+    raw = data.get("raw"); raw_msg = data.get("raw_message")
+    def _get(obj, n):
+        if obj is None: return None
+        try:
+            return obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+        except Exception:
+            return None
+    def _scan(obj):
+        if obj is None: return None
+        if isinstance(obj, str):
+            s = obj.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    parsed = json.loads(s)
+                    u = _scan(parsed)
+                    if u: return u
+                except Exception:
+                    m = re.search(r'https?:(?:\\?/){2}[^"\\\s]+', obj)
+                    if m: return m.group(0).replace("\\/", "/")
+            if obj.startswith("http"):
+                return obj
+            return None
+        keys = ("href","url","oriUrl","normalUrl","hdUrl","thumb","thumbUrl",
+                "imageUrl","src","photoUrl","attachUrl","fileUrl","link","attach")
+        for k in keys:
+            v = _get(obj, k)
+            if v is None: continue
+            u = _scan(v)
+            if u: return u
+        return None
+    def _deep(obj, depth=0, seen=None):
+        if depth > 8 or obj is None: return None
+        if seen is None: seen = set()
+        oid = id(obj)
+        if oid in seen: return None
+        seen.add(oid)
+        if isinstance(obj, (int, float, bool, bytes)): return None
+        if isinstance(obj, str): return _scan(obj)
+        if isinstance(obj, dict):
+            for k in ("quote","reply","quoteMessage","replyMessage","quotedMessage","attach",
+                      "media","photo","image","thumb","href","url"):
+                if k in obj:
+                    r = _deep(obj[k], depth+1, seen)
+                    if r: return r
+            for v in obj.values():
+                r = _deep(v, depth+1, seen)
+                if r: return r
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                r = _deep(v, depth+1, seen)
+                if r: return r
+        else:
+            for a in dir(obj):
+                if a.startswith("_"): continue
+                try: v = getattr(obj, a)
+                except Exception: continue
+                if callable(v): continue
+                r = _deep(v, depth+1, seen)
+                if r: return r
+        return None
+    for src in (raw, raw_msg):
+        if src is None: continue
+        u = _deep(src)
+        if u: return u
+    return None
+
+def _dump_keys_debug(data):
+    out = []
+    for label in ("raw", "raw_message"):
+        obj = data.get(label)
+        if obj is None: out.append(f"{label}: None"); continue
+        t = type(obj).__name__
+        if isinstance(obj, dict):
+            keys = list(obj.keys())
+            out.append(f"{label} ({t}): {keys}")
+            for k in keys:
+                if any(x in str(k).lower() for x in ("quote","reply","attach","media","photo","image","href","thumb")):
+                    out.append(f"  {k} = {str(obj[k])[:200]}")
+        else:
+            attrs = [a for a in dir(obj) if not a.startswith("_")]
+            out.append(f"{label} ({t}) attrs: {attrs[:30]}")
+            for a in attrs:
+                if any(x in a.lower() for x in ("quote","reply","attach","media","photo","image","href","thumb")):
+                    try:
+                        v = getattr(obj, a)
+                        if not callable(v):
+                            out.append(f"  {a} = {str(v)[:200]}")
+                    except Exception: pass
+    return "\n".join(out)
+
+def _get_tmp_dir():
+    try:
+        d = tempfile.gettempdir()
+        if d and os.path.isdir(d): return d
+    except Exception: pass
+    for cand in ("/data/data/com.termux/files/usr/tmp",
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp"),
+                 os.path.expanduser("~")):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            return cand
+        except Exception: continue
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _download_image(url, bot=None):
+    _DL_LOGS.clear()
+    def L(m):
+        _DL_LOGS.append(m)
+        try: print(m)
+        except Exception: pass
+
+    if not url:
+        L("[DL] URL rỗng"); return None
+
+    try:
+        import requests
+    except Exception as e:
+        L(f"[DL] import requests lỗi: {e}"); return None
+
+    url = url.replace("\\/", "/").strip()
+    L(f"[DL] URL: {url[:150]}")
+
+    UA = ("Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+
+    variants = []
+
+    if bot is not None:
+        for sattr in ("_session", "session", "_http", "http", "_requests"):
+            sess = getattr(bot, sattr, None)
+            if sess is not None and hasattr(sess, "get"):
+                variants.append(("bot-session", {"session": sess, "headers": {
+                    "User-Agent": UA, "Referer": "https://chat.zalo.me/",
+                    "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}}))
+
+    variants.append(("no-cookie", {"headers": {
+        "User-Agent": UA, "Referer": "https://chat.zalo.me/",
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}}))
+
+    if bot is not None:
+        ck = getattr(bot, "cookies", None) or getattr(bot, "_cookies", None)
+        ck_dict = None
+        if isinstance(ck, dict):
+            ck_dict = ck
+        elif ck is not None and hasattr(ck, "get_dict"):
+            try: ck_dict = ck.get_dict()
+            except Exception: pass
+        elif ck is not None and hasattr(ck, "items"):
+            try: ck_dict = dict(ck.items())
+            except Exception: pass
+
+        if ck_dict:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in ck_dict.items())
+            variants.append(("cookie-header", {"headers": {
+                "User-Agent": UA, "Referer": "https://chat.zalo.me/",
+                "Cookie": cookie_str,
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}}))
+            variants.append(("cookie-jar", {"headers": {
+                "User-Agent": UA, "Referer": "https://chat.zalo.me/",
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
+                "cookies": ck_dict}))
+
+    L(f"[DL] Thử {len(variants)} cách...")
+    tmp_dir = _get_tmp_dir()
+    L(f"[DL] tmp_dir: {tmp_dir}")
+
+    for name, opt in variants:
+        try:
+            opt = dict(opt)
+            sess = opt.pop("session", None)
+            getter = sess.get if sess is not None else requests.get
+            r = getter(url, timeout=60, allow_redirects=True, **opt)
+
+            ct = r.headers.get("Content-Type", "").lower()
+            size = len(r.content)
+            L(f"[DL] {name}: HTTP {r.status_code} | CT={ct} | size={size}")
+
+            if r.status_code != 200: continue
+            if "image" not in ct and "octet-stream" not in ct: continue
+            if size < 500: continue
+
+            ext = ".jpg"
+            if "png" in ct: ext = ".png"
+            elif "gif" in ct: ext = ".gif"
+            elif "webp" in ct: ext = ".webp"
+            elif "jxl" in ct: ext = ".jxl"
+            elif "jpeg" in ct or "jpg" in ct: ext = ".jpg"
+
+            fp = os.path.join(tmp_dir, f"sticker_src_{int(time.time()*1000)}{ext}")
+            with open(fp, "wb") as f:
+                f.write(r.content)
+            L(f"[DL] OK ({name}) → {size} bytes → {fp}")
+
+            if ext == ".jxl":
+                try:
+                    from PIL import Image
+                    jxl_ok = False
+                    for modname in ("pillow_jxl", "jxlpy", "imagecodecs"):
+                        try:
+                            __import__(modname); jxl_ok = True; break
+                        except Exception: continue
+                    if not jxl_ok:
+                        L(f"[DL] ⚠️ Chưa cài plugin JXL — thử: pip install pillow-jxl-plugin")
+                    img = Image.open(fp)
+                    img.load()
+                    jpg_fp = fp.rsplit(".", 1)[0] + ".jpg"
+                    img.convert("RGB").save(jpg_fp, "JPEG", quality=92)
+                    try: os.remove(fp)
+                    except Exception: pass
+                    L(f"[DL] ✅ Convert JXL → JPG OK")
+                    return jpg_fp
+                except Exception as e:
+                    L(f"[DL] Convert JXL lỗi: {e} (đổi tên thành .jpg)")
+                    try:
+                        jpg_fp = fp.rsplit(".", 1)[0] + ".jpg"
+                        os.rename(fp, jpg_fp)
+                        return jpg_fp
+                    except Exception:
+                        return fp
+            return fp
+        except Exception as e:
+            L(f"[DL] {name}: exception {e}")
+            continue
+
+    L(f"[DL] ❌ Tất cả cách đều thất bại")
+    return None
+
+# ==================== PHẦN TẠO STICKER ĐÃ CHỈNH SỬA ====================
+
+def _create_sticker(bot, image_path):
+    """
+    Tạo sticker từ ảnh:
+    1. Upload lên host giống như lệnh .voice (uguu, catbox, tmpfiles).
+    2. Dự phòng gọi hàm native zlapi.
+    """
+    if not image_path or not os.path.exists(image_path):
+        return None
+
+    # 1. Upload giống .voice
+    url = upload_voice_smart(image_path)
+    if url:
+        print(f"[STICKER] Upload thành công (giống .voice): {url}")
+        return url
+
+    # 2. Dự phòng gọi hàm native zlapi
+    for mname in ("uploadSticker", "createSticker", "addSticker", "makeSticker"):
+        if hasattr(bot, mname):
+            try:
+                r = getattr(bot, mname)(image_path)
+                if r:
+                    if isinstance(r, dict):
+                        for k in ("stickerId", "sticker_id", "id", "stickerUrl", "url"):
+                            if r.get(k): return str(r[k])
+                    elif isinstance(r, str):
+                        return r.strip()
+            except Exception as e:
+                print(f"[STICKER] {mname} error: {e}")
+
+    return None
+
+def _send_sticker_now(bot, tid, ttype, sticker_id):
+    """
+    Gửi sticker qua URL hoặc Sticker ObjectID
+    """
+    if not sticker_id: return False
+
+    # Trường hợp sticker là URL
+    if isinstance(sticker_id, str) and sticker_id.startswith("http"):
+        # Thử gửi dạng Custom Sticker (từ URL)
+        for mname in ("sendCustomSticker", "sendStickerUrl", "sendStickerByUrl"):
+            if hasattr(bot, mname):
+                method = getattr(bot, mname)
+                # Thử gọi bằng keyword arguments (cách an toàn nhất)
+                try:
+                    method(stickerId=sticker_id, thread_id=tid, thread_type=ttype)
+                    return True
+                except Exception as e:
+                    print(f"[SEND STICKER URL] {mname} (kw) lỗi: {e}")
+                # Thử gọi bằng positional arguments
+                try:
+                    method(sticker_id, tid, ttype)
+                    return True
+                except Exception as e:
+                    print(f"[SEND STICKER URL] {mname} (pos) lỗi: {e}")
+
+        # Fallback: Tải ảnh về máy rồi gửi dạng ảnh (vì Zalo không nhận link ngoài làm sticker)
+        print("[SEND STICKER] Thử fallback: Tải ảnh và gửi dạng image...")
+        try:
+            import requests
+            r = requests.get(sticker_id, timeout=30)
+            if r.status_code == 200:
+                tmp_dir = _get_tmp_dir()
+                local_path = os.path.join(tmp_dir, f"sticker_fallback_{int(time.time()*1000)}.jpg")
+                with open(local_path, "wb") as f:
+                    f.write(r.content)
+                res = bot_send_image(bot, tid, ttype, local_path)
+                try: os.remove(local_path)
+                except Exception: pass
+                return res
+        except Exception as e:
+            print(f"[SEND STICKER] Lỗi fallback image: {e}")
+        return False
+
+    # Trường hợp gửi bằng Sticker ID
+    if Sticker is not None:
+        try:
+            s = Sticker(sticker_id)
+            if hasattr(bot, "sendSticker"):
+                try:
+                    bot.sendSticker(s, tid, ttype)
+                    return True
+                except Exception: pass
+        except Exception: pass
+
+    for mname in ("sendSticker", "sendStickerMessage"):
+        if hasattr(bot, mname):
+            method = getattr(bot, mname)
+            for args in ((sticker_id, tid, ttype), (tid, ttype, sticker_id)):
+                try:
+                    method(*args); return True
+                except Exception: pass
+            for kw in ({"stickerId": sticker_id, "thread_id": tid, "thread_type": ttype},
+                       {"sticker_id": sticker_id, "thread_id": tid, "thread_type": ttype}):
+                try:
+                    method(**kw); return True
+                except Exception: pass
+
+    return False
+
+def handle_taosticker(bot, tid, ttype, uid, ctext, data):
+    if not is_user_allowed(uid) and not is_owner(uid):
+        send_reply(bot, tid, ttype, f"{LOCK} Không có quyền!"); return
+
+    image_path = None
+    src_desc = ""
+
+    # 1. Trích xuất ảnh từ tin nhắn reply
+    if data:
+        url = _extract_image_url(data)
+        if url:
+            send_reply(bot, tid, ttype, f"🔄 Đang tải ảnh từ reply...")
+            image_path = _download_image(url, bot)
+            src_desc = f"reply ({url[:40]}...)"
+
+    # 2. Trích xuất từ tham số (Link HTTP hoặc tên file local)
+    if not image_path:
+        parts = ctext.split(maxsplit=1)
+        if len(parts) >= 2:
+            arg = parts[1].strip()
+            if arg.startswith("http"):
+                send_reply(bot, tid, ttype, f"🔄 Đang tải ảnh từ URL...")
+                image_path = _download_image(arg, bot)
+                src_desc = f"url ({arg[:40]}...)"
+            else:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                fp = arg if os.path.isabs(arg) else os.path.join(base_dir, arg)
+                if os.path.exists(fp) and fp.lower().endswith(IMAGE_EXTS):
+                    image_path = fp
+                    src_desc = f"file ({arg})"
+
+    # 3. Quét lấy file ảnh đầu tiên trong thư mục nếu không truyền tham số
+    if not image_path and len(ctext.split()) == 1:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            for f in os.listdir(base_dir):
+                if f.lower().endswith(IMAGE_EXTS):
+                    image_path = os.path.join(base_dir, f)
+                    src_desc = f"auto ({f})"
+                    break
+        except Exception: pass
+
+    if not image_path or not os.path.exists(image_path):
+        send_reply(bot, tid, ttype,
+            f"{FAIL} KHÔNG TÌM THẤY ẢNH!\n{LINE}\n"
+            f"▸ Reply vào 1 ảnh + gõ `{PREFIX}taosticker`\n"
+            f"▸ Hoặc: `{PREFIX}taosticker <url_ảnh>`\n"
+            f"▸ Hoặc: `{PREFIX}taosticker <tên_file.jpg>`")
+        return
+
+    send_reply(bot, tid, ttype, f"🎨 Đang xử lý sticker...")
+    sticker_id = _create_sticker(bot, image_path)
+
+    if not sticker_id:
+        send_reply(bot, tid, ttype, f"{FAIL} Tạo sticker thất bại! Hãy thử lại với ảnh khác.")
+        return
+
+    CUSTOM_STICKERS[str(sticker_id)] = {
+        "src": src_desc,
+        "created_by": str(uid),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "path": image_path
+    }
+    save_json(STICKER_FILE, CUSTOM_STICKERS)
+
+    sent = _send_sticker_now(bot, tid, ttype, sticker_id)
+    msg = f"{OK} ĐÃ TẠO STICKER THÀNH CÔNG!\n{LINE}\n▸ ID/Link: `{sticker_id}`"
+    if not sent:
+        msg += f"\n\n{WARN} Không thể gửi dạng sticker do API Zalo chặn. Đã gửi dạng ảnh thay thế."
+    send_reply(bot, tid, ttype, msg)
+
+def handle_guisticker(bot, tid, ttype, uid, ctext):
+    if not is_user_allowed(uid) and not is_owner(uid):
+        send_reply(bot, tid, ttype, f"{LOCK} Không có quyền!"); return
+    parts = ctext.split(maxsplit=1)
+    if len(parts) < 2:
+        send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}guisticker <sticker_id/url>"); return
+    sid = parts[1].strip()
+    if _send_sticker_now(bot, tid, ttype, sid):
+        send_reply(bot, tid, ttype, f"{OK} Đã gửi sticker thành công!")
+    else:
+        send_reply(bot, tid, ttype, f"{FAIL} Gửi sticker thất bại!")
+
+def handle_stickerlist(bot, tid, ttype, uid):
+    if not is_user_allowed(uid) and not is_owner(uid):
+        send_reply(bot, tid, ttype, f"{LOCK} Không có quyền!"); return
+    if not CUSTOM_STICKERS:
+        send_reply(bot, tid, ttype, f"{INFO} Danh sách sticker đang trống."); return
+    t = f"🎨 DS STICKER ĐÃ TẠO ({len(CUSTOM_STICKERS)})\n{LINE}"
+    for i, (sid, info) in enumerate(list(CUSTOM_STICKERS.items())[:30], 1):
+        t += f"\n{DOT} {i}. `{sid[:30]}...` — {info.get('src','?')[:30]}"
+    if len(CUSTOM_STICKERS) > 30: t += f"\n... và {len(CUSTOM_STICKERS)-30} sticker khác"
+    t += f"\n\n{INFO} Dùng `{PREFIX}guisticker <id>` để gửi lại"
+    send_reply(bot, tid, ttype, t)
+
+def handle_xoasticker(bot, tid, ttype, uid, ctext):
+    if not is_owner(uid):
+        send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner!"); return
+    parts = ctext.split()
+    if len(parts) < 2:
+        send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}xoasticker <sticker_id>"); return
+    sid = parts[1].strip()
+    if sid not in CUSTOM_STICKERS:
+        send_reply(bot, tid, ttype, f"{WARN} Không tìm thấy sticker này!"); return
+    del CUSTOM_STICKERS[sid]
+    save_json(STICKER_FILE, CUSTOM_STICKERS)
+    send_reply(bot, tid, ttype, f"🗑️ Đã xóa sticker thành công!")
+
+# =========================================================================
+
+def handle_dice(bot, tid, ttype, uid):
+    n = random.randint(1, 6); faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+    send_reply(bot, tid, ttype, f"🎲 XÚC XẮC\n{LINE}\n▸ Kết quả: {faces[n-1]} **{n}**")
+
+def handle_coin(bot, tid, ttype, uid):
+    send_reply(bot, tid, ttype, f"🪙 LẬT ĐỒNG XU\n{LINE}\n▸ Kết quả: **{random.choice(['Ngửa (Heads)', 'Sấp (Tails)'])}**")
+
+def handle_daovang(bot, tid, ttype, uid): handle_coin(bot, tid, ttype, uid)
+
+def handle_rps(bot, tid, ttype, uid, ctext):
+    parts = ctext.split(maxsplit=1)
+    if len(parts) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}rps <kéo|búa|bao>"); return
+    user_choice = parts[1].strip().lower()
+    mapping = {"kéo":"kéo","keo":"kéo","búa":"búa","bua":"búa","bao":"bao","báo":"bao"}
+    user_choice = mapping.get(user_choice)
+    if not user_choice: send_reply(bot, tid, ttype, f"{FAIL} Chỉ chọn: kéo / búa / bao"); return
+    bot_choice = random.choice(["kéo", "búa", "bao"]); emoji = {"kéo":"✌️","búa":"✊","bao":"🖐️"}
+    if user_choice == bot_choice: result = "HÒA 🤝"
+    elif (user_choice == "kéo" and bot_choice == "bao") or (user_choice == "búa" and bot_choice == "kéo") or (user_choice == "bao" and bot_choice == "búa"): result = "BẠN THẮNG 🎉"
+    else: result = "BOT THẮNG 🤖"
+    t = f"✊ OẰN TÙ TÌ\n{LINE}\n▸ Bạn : {emoji[user_choice]} {user_choice}\n▸ Bot : {emoji[bot_choice]} {bot_choice}\n\n▸ Kết quả: **{result}**"
+    send_reply(bot, tid, ttype, t)
+
+def handle_doanso(bot, tid, ttype, uid, ctext):
+    key = f"{tid}:{uid}"; parts = ctext.split(maxsplit=1)
+    if len(parts) < 2:
+        GAME_STATE[key] = {"game":"doanso","number":random.randint(1,100),"tries":0,"time":time.time()}
+        send_reply(bot, tid, ttype, f"🎯 ĐOÁN SỐ 1-100\n{LINE}\n▸ Bot đã chọn 1 số\n▸ Gõ {PREFIX}doanso <số> để đoán\n▸ Bạn có 7 lần đoán"); return
+    if key not in GAME_STATE or GAME_STATE[key].get("game") != "doanso": send_reply(bot, tid, ttype, f"{WARN} Chưa bắt đầu! Gõ {PREFIX}doanso"); return
+    state = GAME_STATE[key]
+    if time.time() - state["time"] > 300: del GAME_STATE[key]; send_reply(bot, tid, ttype, f"{WARN} Hết thời gian!"); return
+    try: guess = int(parts[1].strip())
+    except ValueError: send_reply(bot, tid, ttype, f"{FAIL} Phải nhập số 1-100"); return
+    if guess < 1 or guess > 100: send_reply(bot, tid, ttype, f"{FAIL} Số phải từ 1-100"); return
+    state["tries"] += 1; target = state["number"]
+    if guess == target: del GAME_STATE[key]; send_reply(bot, tid, ttype, f"🎉 ĐÚNG RỒI!\n▸ Số đúng: **{target}**\n▸ Đoán đúng sau {state['tries']} lần!")
+    elif state["tries"] >= 7: del GAME_STATE[key]; send_reply(bot, tid, ttype, f"💥 THUA RỒI!\n▸ Số đúng là: **{target}**")
+    elif guess < target: send_reply(bot, tid, ttype, f"📈 LỚN HƠN {guess}!\n▸ Còn {7-state['tries']} lần đoán")
+    else: send_reply(bot, tid, ttype, f"📉 NHỎ HƠN {guess}!\n▸ Còn {7-state['tries']} lần đoán")
+
+def handle_8ball(bot, tid, ttype, uid, ctext):
+    parts = ctext.split(maxsplit=1)
+    if len(parts) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}8ball <câu hỏi>"); return
+    answers = ["Chắc chắn rồi ✅","Không đâu ❌","Có thể 🤔","Đừng mơ 😂","Có nhé 😊","Không bao giờ 🙅","Hỏi lại sau đi","Chính xác 💯","Không nên 🚫","Nên làm đi 👍","Có duyên đấy 🌟","Không liên quan 🤷","Sẽ thành công 🎯","Thất bại đấy 💔","Rất tốt ✨","Tệ lắm 👎"]
+    send_reply(bot, tid, ttype, f"🎱 BÓI TOÁN\n{LINE}\n▸ Câu hỏi: {parts[1].strip()}\n▸ Trả lời: **{random.choice(answers)}**")
+
+def handle_rate(bot, tid, ttype, uid, ctext):
+    parts = ctext.split(maxsplit=1)
+    if len(parts) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}rate <nội dung>"); return
+    score = random.randint(1, 10); stars = "⭐" * score + "☆" * (10 - score)
+    send_reply(bot, tid, ttype, f"📊 ĐÁNH GIÁ\n{LINE}\n▸ Nội dung: {parts[1].strip()}\n▸ Điểm: **{score}/10**\n{stars}")
+
+def handle_rand(bot, tid, ttype, uid, ctext):
+    parts = ctext.split()
+    if len(parts) < 3: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}rand <min> <max>"); return
+    try: a = int(parts[1]); b = int(parts[2])
+    except ValueError: send_reply(bot, tid, ttype, f"{FAIL} Phải là số!"); return
+    if a > b: a, b = b, a
+    send_reply(bot, tid, ttype, f"🎲 RANDOM\n{LINE}\n▸ Khoảng: {a} - {b}\n▸ Kết quả: **{random.randint(a, b)}**")
+
+def handle_chon(bot, tid, ttype, uid, ctext):
+    parts = ctext.split(maxsplit=1)
+    if len(parts) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cú pháp: {PREFIX}chon <a | b | c>"); return
+    items = [x.strip() for x in parts[1].split("|") if x.strip()]
+    if len(items) < 2: send_reply(bot, tid, ttype, f"{FAIL} Cần ít nhất 2 lựa chọn, cách nhau bằng `|`"); return
+    pick = random.choice(items)
+    t = f"🎯 CHỌN NGẪU NHIÊN\n{LINE}\n"
+    for i, it in enumerate(items, 1): t += f"▸ {i}. {it}\n"
+    t += f"\n{OK} Kết quả: **{pick}**"
+    send_reply(bot, tid, ttype, t)
+
+def handle_tuvan(bot, tid, ttype, uid):
+    advices = ["Hãy tin vào bản thân mình 💪","Nghỉ ngơi một chút đi ☕","Hôm nay là ngày tốt để bắt đầu điều mới ✨","Đừng lo lắng quá, mọi chuyện sẽ ổn 🌈","Hãy nói ra điều bạn nghĩ 💬","Tập trung vào mục tiêu quan trọng nhất 🎯","Đi ngủ sớm đi cho khỏe 😴","Học hỏi từ sai lầm 📚","Hãy gọi điện cho người thân 📞","Uống nhiều nước vào 💧","Đọc sách nhiều hơn 📖","Đi dạo một vòng đi 🚶"]
+    send_reply(bot, tid, ttype, f"💡 TƯ VẤN\n{LINE}\n▸ {random.choice(advices)}")
+
+def handle_unknown_command(bot, tid, ttype, cmd):
+    sug = []
+    for k in COMMANDS.keys():
+        if abs(len(k) - len(cmd)) <= 2:
+            if sum(1 for a, b in zip(cmd, k) if a == b) >= max(1, len(cmd) - 2): sug.append(k)
+    t = f"{FAIL} LỆNH KHÔNG TỒN TẠI\n{LINE}\n▸ Bạn gõ: {PREFIX}{cmd}"
+    if sug:
+        t += f"\n\n{INFO} Có phải bạn muốn?"
+        for s in sug[:3]: t += f"\n  {DOT} {PREFIX}{s}  {ARROW}  {COMMANDS[s]}"
+    t += f"\n\n✨ Gõ {PREFIX}menu để xem menu."
+    send_reply(bot, tid, ttype, t)
+
+def process_command(bot, tid, ttype, data, uid, ctext):
+    global BOT_SLEEPING
+    parts = ctext.split()
+    if not parts: return
+    cmd = parts[0].lower(); args = parts[1:]
+
+    if BOT_SLEEPING:
+        if cmd == "boton" and is_owner(uid): handle_boton(bot, tid, ttype, uid)
+        elif cmd == "boton": send_reply(bot, tid, ttype, f"{FAIL} Chỉ Owner đánh thức!")
+        else: print(f"[SLEEP] Bỏ qua: {cmd}")
+        return
+
+    if cmd in ("help","menu"): handle_help(bot, tid, ttype); return
+    if cmd == "menuad": handle_menuad(bot, tid, ttype); return
+    if cmd == "minigame": handle_minigame(bot, tid, ttype); return
+
+    if cmd == "info": handle_info(bot, tid, ttype); return
+    if cmd == "ping": handle_ping(bot, tid, ttype); return
+    if cmd == "uptime": handle_uptime(bot, tid, ttype); return
+    if cmd == "test": handle_test(bot, tid, ttype); return
+
+    if cmd == "capquyen": handle_capquyen(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "thuquyen": handle_thuquyen(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "dsquyen": handle_dsquyen(bot, tid, ttype, uid); return
+    if cmd == "sleep": handle_sleep(bot, tid, ttype, uid); return
+    if cmd == "boton": handle_boton(bot, tid, ttype, uid); return
+    if cmd == "botoff": handle_botoff(bot, tid, ttype, uid); return
+    if cmd == "war": handle_war(bot, tid, ttype, uid, args); return
+    if cmd == "chui": handle_chui(bot, tid, ttype, uid, args, ctext, data); return
+    if cmd == "spam": handle_spam(bot, tid, ttype, uid, args, ctext, data); return
+    if cmd == "anh": handle_anh(bot, tid, ttype, uid, args, ctext); return
+    if cmd == "voice": handle_voice(bot, tid, ttype, uid, args, ctext); return
+    if cmd == "stop": handle_stop(bot, tid, ttype, uid); return
+    if cmd == "copy": handle_copy(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "uncopy": handle_uncopy(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "dscopy": handle_dscopy(bot, tid, ttype, uid); return
+
+    if cmd == "mute": handle_mute(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "muteid": handle_muteid(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "unmute": handle_unmute(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "dsmute": handle_dsmute(bot, tid, ttype, uid); return
+    if cmd == "checkmute": handle_checkmute(bot, tid, ttype, data, uid, ctext); return
+
+    if cmd == "debuggroup": handle_debuggroup(bot, tid, ttype, uid); return
+    if cmd == "debugmem": handle_debugmem(bot, tid, ttype, uid); return
+
+    if cmd == "groupinfo": handle_groupinfo(bot, tid, ttype); return
+    if cmd == "setname": handle_setname(bot, tid, ttype, uid, ctext); return
+    if cmd == "kick": handle_kick(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "adduser": handle_adduser(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "promote": handle_promote(bot, tid, ttype, data, uid, ctext); return
+    if cmd == "demote": handle_demote(bot, tid, ttype, data, uid, ctext); return
+
+    if cmd == "antilink": handle_antilink(bot, tid, ttype, uid); return
+    if cmd == "antiimage": handle_antiimage(bot, tid, ttype, uid); return
+    if cmd == "antivideo": handle_antivideo(bot, tid, ttype, uid); return
+    if cmd == "antifile": handle_antifile(bot, tid, ttype, uid); return
+    if cmd == "lock": handle_lock(bot, tid, ttype, uid); return
+    if cmd == "unlock": handle_unlock(bot, tid, ttype, uid); return
+    if cmd == "settings": handle_settings(bot, tid, ttype); return
+
+    if cmd == "dice": handle_dice(bot, tid, ttype, uid); return
+    if cmd == "coin": handle_coin(bot, tid, ttype, uid); return
+    if cmd == "daovang": handle_daovang(bot, tid, ttype, uid); return
+    if cmd == "rps": handle_rps(bot, tid, ttype, uid, ctext); return
+    if cmd == "doanso": handle_doanso(bot, tid, ttype, uid, ctext); return
+    if cmd == "8ball": handle_8ball(bot, tid, ttype, uid, ctext); return
+    if cmd == "rate": handle_rate(bot, tid, ttype, uid, ctext); return
+    if cmd == "rand": handle_rand(bot, tid, ttype, uid, ctext); return
+    if cmd == "chon": handle_chon(bot, tid, ttype, uid, ctext); return
+    if cmd == "tuvan": handle_tuvan(bot, tid, ttype, uid); return
+
+    if cmd == "taosticker": handle_taosticker(bot, tid, ttype, uid, ctext, data); return
+    if cmd == "guisticker": handle_guisticker(bot, tid, ttype, uid, ctext); return
+    if cmd in ("stickerlist", "dssticker"): handle_stickerlist(bot, tid, ttype, uid); return
+    if cmd == "xoasticker": handle_xoasticker(bot, tid, ttype, uid, ctext); return
+
+    handle_unknown_command(bot, tid, ttype, cmd)
+
+def handle_incoming_message(bot, mid, author_id, message, message_object, tid, ttype):
+    text = parse_message_text(message)
+    media_type = detect_media_type(message)
+    is_media_msg = media_type is not None
+    print(f"\n{'=' * 55}\n[IN] author={author_id} tid={tid} ttype={ttype}\n     media={media_type} text={text[:80]!r}")
+    if not tid: return
+    author_str = str(author_id) if author_id else ""
+    is_from_bot = (author_str == str(BOT_OWNER_ID))
+    is_from_admin = is_group_admin(bot, tid, author_id) if not is_from_bot else True
+    if not is_from_bot:
+        muted = None
+        if author_str in MUTED_USERS: muted = author_str
+        elif not text.startswith(PREFIX):
+            for uid in extract_mentions(message_object):
+                if str(uid) in MUTED_USERS: muted = str(uid); break
+        if muted:
+            print(f"     → 🔇 MUTE → xóa")
+            delete_message(bot, message_object, tid, ttype, author_id=author_str); return
+    gs = get_group_settings(tid)
+    block = False; reason = ""
+    if not is_from_bot and not is_from_admin:
+        if gs.get("lock"): block = True; reason = "Nhóm bị KHÓA"
+        elif gs.get("antilink") and text and contains_link(text): block = True; reason = "Chặn LINK"
+        elif gs.get("antiimage") and media_type == "image": block = True; reason = "Chặn ẢNH"
+        elif gs.get("antivideo") and media_type == "video": block = True; reason = "Chặn VIDEO"
+        elif gs.get("antifile") and media_type == "file": block = True; reason = "Chặn FILE"
+    if block:
+        # Xoá im lặng — không thông báo gì
+        print(f"     → 🚫 {reason} → xóa (im lặng)")
+        delete_message(bot, message_object, tid, ttype, author_id=author_str)
+        return
+    if not is_from_bot and author_str in COPY_TARGETS and text and not text.startswith(PREFIX):
+        do_copy_message(bot, author_id, text, tid, ttype, get_msg_id(message_object))
+    if is_media_msg and not text: return
+    if check_war_confirmation(bot, tid, ttype, author_id, text): return
+    if not text.startswith(PREFIX): return
+    ctext = text[len(PREFIX):].strip()
+    if not ctext: return
+    print(f"     → ✅ XỬ LÝ: {ctext}")
+    data = {"raw": message_object, "raw_message": message}
+    try:
+        process_command(bot, tid, ttype, data, author_id, ctext)
+    except Exception as e:
+        print(f"[!] Lỗi: {e}"); import traceback; traceback.print_exc()
+
+def handle_undo_message(bot, mid, author_id, tid, ttype):
+    if not tid or not mid: return
+    do_undo_copy(mid, tid, ttype)
+
+class ZaloBot(ZaloAPI):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def onMessage(self, mid=None, author_id=None, message=None, message_object=None, thread_id=None, thread_type=ThreadType.USER):
+        if author_id is not None and message is not None:
+            try: handle_incoming_message(self, mid, author_id, message, message_object, thread_id, thread_type)
+            except Exception as e: print(f"[!] Lỗi onMessage: {e}")
+        try: return super().onMessage(mid, author_id, message, message_object, thread_id, thread_type)
+        except Exception: pass
+    def onUndo(self, *args, **kwargs):
+        mid = args[0] if len(args) >= 1 else kwargs.get("mid")
+        author_id = args[1] if len(args) >= 2 else kwargs.get("author_id")
+        tid = args[4] if len(args) >= 5 else kwargs.get("thread_id")
+        ttype = args[5] if len(args) >= 6 else kwargs.get("thread_type")
+        try: handle_undo_message(self, mid, author_id, tid, ttype)
+        except Exception as e: print(f"[!] Lỗi onUndo: {e}")
+        try: return super().onUndo(*args, **kwargs)
+        except Exception: pass
+
+print("=" * 55); print("🤖 Đang khởi tạo bot Zalo..."); print("=" * 55)
+try:
+    bot = ZaloBot(phone=None, password=None, imei=IMEI, cookies=COOKIES)
+    BOT_OWNER_ID = str(_call(getattr(bot, "uid")))
+    print(f"✅ Đăng nhập OK! UID: {BOT_OWNER_ID}")
+except Exception as e:
+    print(f"❌ Lỗi đăng nhập: {e}"); import traceback; traceback.print_exc(); sys.exit(1)
+
+for attr in ("display_name","name","username","user_name","displayName"):
+    v = getattr(bot, attr, None)
+    if v:
+        v = _call(v)
+        if isinstance(v, str) and v: BOT_NAME = v; break
+
+print(f"📛 Tên bot: {BOT_NAME}"); print(f"👑 Owner: {BOT_OWNER_ID}"); print("=" * 55)
+
+if __name__ == "__main__":
+    print(f"\n🤖 Bot sẵn sàng! Prefix: {PREFIX}")
+    print(f"👑 Owner: {BOT_OWNER_ID}")
+    print(f"👥 Users: {len(ALLOWED_USERS)} | Muted: {len(MUTED_USERS)}")
+    print(f"🎨 Sticker: {len(CUSTOM_STICKERS)}")
+    print(f"🎲 Games: dice, coin, rps, doanso, 8ball, rate, rand, chon, tuvan")
+    print(f"📋 Menu:  .menu | .menuad | .minigame")
+    print(f"🔍 Debug: .debuggroup | .debugmem")
+    print("=" * 55)
+    try:
+        bot.listen(run_forever=True)
+    except TypeError:
+        try: bot.listen()
+        except KeyboardInterrupt: print("\n👋 Dừng.")
+        except Exception as e: print(f"❌ Lỗi: {e}")
+    except KeyboardInterrupt: print("\n👋 Dừng.")
+    except Exception as e:
+        print(f"❌ Lỗi: {e}"); import traceback; traceback.print_exc()
