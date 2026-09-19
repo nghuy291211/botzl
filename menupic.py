@@ -223,7 +223,7 @@ def render_menu(text, out_path=None, title=None,
     lines = [l for l in raw_lines if l.strip()]
 
     if title is None:
-        title = lines[0] if lines else "MENU"
+        title = lines[0] if lines else "MENU - BY NGHUY"
         lines = lines[1:]
     title = _clean(title)
 
@@ -290,7 +290,7 @@ def render_menu(text, out_path=None, title=None,
 
 
 # ================= RENDER CARD MENU (VUÔNG 1080x1080) =================
-def render_card_menu(commands, title="MENU", page_num=1, out_path=None,
+def render_card_menu(commands, title="MENU - BYNGHUY", page_num=1, out_path=None,
                      card_tag="USER"):
     """Menu card VUÔNG 1080x1080 — vẽ trực tiếp, giống QAZN."""
     if Image is None:
@@ -391,3 +391,4 @@ def clear_cache():
     global _bg_cache
     with _bg_lock:
         _bg_cache = None
+        
